@@ -1,0 +1,641 @@
+\chapter{Background}\label{ch:background}
+
+This chapter reviews previous work that motivates and informs this thesis.
+We first review workload-specific operating system specialization techniques (kernel profiling, profile-guided optimization, and debloating).
+We then focus on \emph{autotuning} methods for large configuration spaces, especially \textit{knob} tuning, following the taxonomy and pipeline summarized in a recent survey~\cite{autotune_survey}.
+
+\section{Motivation: Specialization in a General-Purpose Kernel}\label{sec:bg-motivation}
+
+As discussed in Chapter~\ref{ch:introduction}, modern deployments increasingly run single-purpose services inside dedicated virtual machines or containers.
+In this setting, the Linux kernel still provides a very broad set of features and configuration parameters, many of which are irrelevant to a given workload. This mismatch motivates two complementary research directions:
+\begin{itemize}
+    \item \textbf{Specializing the kernel itself} (e.g., compiling or configuring a smaller/faster kernel for a target workload).
+    \item \textbf{Specializing kernel \emph{behavior}} via runtime configuration (\textit{knobs}), ideally tuned automatically.
+\end{itemize}
+
+\section{Kernel Profiling and Profile-Guided Optimization (PGO)}\label{sec:bg-pgo}
+
+A representative approach to workload-driven kernel specialization is profile-guided optimization.
+The key idea is to observe kernel execution under representative applications, derive a profile, and then use compiler-driven optimizations to produce a faster kernel binary.
+
+\subsection{Universal profiles across data center applications}\label{sec:bg-one-profile}
+
+\emph{One Profile Fits All: Profile-Guided Linux Kernel Optimizations for Data Center Applications}~\cite{one_profile_fits_all} explores whether a \emph{single} kernel execution profile can represent a broad range of common data center workloads.
+The paper characterizes kernel behavior for several widely used applications spanning:
+\begin{itemize}
+    \item Web servers (e.g., Apache, Nginx).
+    \item In-memory caching (e.g., Redis, Memcached).
+    \item Embedded key, value stores (e.g., LevelDB, RocksDB).
+    \item Relational databases (e.g., MySQL, PostgreSQL).
+\end{itemize}
+
+\paragraph{Profile collection.}
+The authors combine standard profiling and instrumentation tooling to collect control-flow and frequency information, such as function execution frequencies and branch execution frequencies.
+These profiles are then used to drive PGO-based (Profile Guided Optimization) compilation of the kernel (e.g., using LLVM/Clang profile tooling and profile merging).
+
+\paragraph{Comparing profiles across applications.}
+To quantify how kernel profiles vary across workloads, the paper builds feature vectors over a common ordered feature set.
+For example:
+\begin{enumerate}
+    \item \emph{Function frequency}: vector whose components count how often each kernel function is executed. 
+    \item \emph{Branch frequency}: vector whose components count executions of specific branch sites.
+\end{enumerate}
+The similarity of these vectors is compared using metrics such as cosine similarity and $L_p$ norms, and the results are summarized via confusion-matrix-style comparisons.
+
+\paragraph{Relevance to this thesis.}
+While PGO-based specialization confirms that kernel behavior is heavily workload-dependent, it primarily targets \textit{static binary layout} optimizations (e.g., code placement, branch prediction hints) rather than dynamic runtime configuration.
+Critically, the paper pursuit of a \textit{universal profile} highlights a fundamental limitation: by merging the conflicting execution patterns of diverse workloads (e.g., latency-sensitive Redis vs.\ throughput-heavy Nginx), the resulting \textit{one-size-fits-all} profile essentially effectively becomes a \textit{lowest common denominator}.
+This inevitably leads to a \textit{sub-optimal} configuration for any single, specialized application.
+In contrast, the objective of this thesis is to leverage static analysis not to generalize, but to strictly specialize the kernel runtime parameters (\texttt{sysctl} knobs) for individual, isolated workloads.
+
+\section{Performance Evolution of Linux Core Operations}\label{sec:bg-linux-evolution}
+
+To understand the necessity of kernel tuning, one must first recognizje the trajectory of kernel performance over time. The Linux Kernel is not a static artifact; it is in a constant state of flux, accumulating new features, security mitigations, and architectural changes with every release.
+
+\paragraph{Quantifying Degradation.}
+In \textit{An Analysis of Performance Evolution of Linux's Core Operations}~\cite{linux_core_ops_evolution}, Ren et al.\ conduct a longitudinal study of Linux kernel performance spanning seven years (versions 3.0 to 4.15). 
+Using \texttt{strace} to measure the CPU time and call frequency of system calls across various workloads, they identified a concerning trend: many core operations, such as \texttt{sys\_write}, \texttt{sys\_open}, and \texttt{sys\_mmap}, have suffered significant performance degradation over time.
+
+\paragraph{Methodology and Findings.}
+The authors isolated the system calls that consumed the most CPU time across their target workloads. By analyzing the execution paths of these \textit{hot} system calls, they attributed the slowdowns primarily to increased code complexity. 
+Specifically, they identified that a small number of changes (approximately 11 key commits) were responsible for the majority of the latency increase. These changes were often related to:
+\begin{itemize}
+    \item \textbf{Security Hardening}: Mitigations for hardware vulnerabilities (e.g., Spectre and Meltdown) and the introduction of stricter page table isolation.
+    \item \textbf{Feature Bloat}: The addition of complex subsystems like \texttt{cgroups} (control groups), which intercept standard operations to enforce resource limits, adding overhead even when not heavily utilized.
+\end{itemize}
+
+\paragraph{Visualization of Bottlenecks.}
+To further understand these overheads, visualization techniques such as Flame Graphs are often employed. As illustrated in the standard analysis of a \texttt{sys\_write} (Figure \ref{fig:syswrte_flame}) operation:
+\begin{itemize}
+    \item \textbf{Y-Axis (Stack Depth):} Represents the chain of function calls. The bottom frames are the parents (e.g., \texttt{sys\_write}), and the top frames are the children (e.g., \texttt{tcp\_sendmsg}, \texttt{ip\_output}).
+    \item \textbf{X-Axis (Population):} The width of a bar represents the frequency of that function in the samples. Wider bars indicate code paths that consumed more CPU time.
+\end{itemize}
+This visualization allows for the identification of specific bottlenecks within the TCP/IP stack during high-throughput write operations, confirming the findings of Ren et al.\ that the \textit{depth} and complexity of these stacks are increasing.
+
+\begin{figure}
+    \centering
+    \includesvg[width=1\linewidth, inkscapelatex=false]{images/2_background/syswrite_flame}
+    \caption{Flame graph visualization for \texttt{sys\_write}. The $y$-axis represents the stack depth (function call chain), while the $x$-axis represents the CPU time consumed (population). Wide ``towers'' indicate deep call stacks that dominate performance.}
+    \label{fig:syswrte_flame}
+\end{figure}
+
+\paragraph{Relevance to this Thesis.}
+The findings of Ren et al.\ are critical to the motivation of this thesis. 
+First, the fact that core operations are degrading implies that default configurations—often established years ago—are no longer optimal for modern kernels burdened with new security and feature layers. 
+Second, the identified source of slowdowns (increased code complexity and deep call stacks) directly exacerbates the \textit{Search Space} problem for autotuners. 
+As the kernel adds more layers (like cgroups or complex VFS hooks), the number of potential configuration knobs increases, making manual tuning impossible and automated discovery essential.
+
+\section{Kernel Debloating and Configuration Specialization}\label{sec:bg-debloating}
+
+While the previous section highlighted the growing complexity of the kernel, a parallel body of research focuses on \textit{Kernel Debloating}, the process of reducing the kernel attack surface and binary size by removing unused functionality. This domain is highly relevant to this thesis, as it shares the fundamental goal of mapping high-level workloads to specific kernel configuration options (\texttt{Kconfig} or \texttt{sysctl}).
+
+\paragraph{Cozart: Instruction-Level Tracing.}
+A prominent framework in this domain is \textit{Cozart}~\cite{cozart_cacm}, which proposes a methodology for generating minimal kernel configurations tailored to specific applications. 
+
+Unlike previous approaches that relied on coarse-grained function tracing (e.g., \texttt{ftrace}), Cozart employs \textbf{instruction-level tracing} built on top of the QEMU emulator~\cite{qemu}. 
+By monitoring execution during both the boot phase and the application runtime, Cozart tracks exactly which kernel code paths are executed and maps them back to their controlling configuration options.
+The output is a \textit{Configlet}, a minimal set of configuration options required to support the specific workload.
+
+\paragraph{Offline Tracing Strategy.}
+A key insight of Cozart is to move the heavy overhead of instruction tracing off the critical path. 
+Instead of tracing in production, profiling is performed offline in a controlled environment. 
+This allows for deep visibility into the kernel behavior without degrading production performance.
+
+\paragraph{The Dynamic Coverage Limitation.}
+Despite its effectiveness in debloating, Cozart reveals a critical limitation inherent to all dynamic analysis approaches. 
+As the authors explicitly note, the accuracy of the generated profile is entirely dependent on the quality of the test suite used to drive the application. 
+\begin{quote}
+    `An essential limitation of using dynamic-tracing based techniques is the imperfect existence of test suites and benchmarks \ldots the official test suites of many open source applications have low code coverage.`~\cite{cozart_cacm}
+\end{quote}
+If a benchmark fails to trigger a specific edge case (such as a network timeout handling routine or a rare error condition), the dynamic tracer assumes that the code is ``dead'' and may recommend disabling the associated configuration. 
+In the context of autotuning, this is a dangerous blind spot. A tuning framework must be aware of parameters that control rare but critical behaviors (e.g., TCP retransmission timeouts). 
+This limitation underscores the necessity of the \textbf{Static Analysis} approach proposed in this thesis, which provides a conservative, over-approximated graph of all theoretically reachable paths, ensuring no critical control knobs are missed due to lack of runtime coverage.
+
+\section{Automated Parameter Tuning Systems}\label{sec:bg-autotuning}
+
+The remainder of this chapter focuses on methods that \textit{automatically} search large configuration spaces to improve a performance objective (e.g., throughput or latency).
+In systems, ``configuration'' may include cloud resources (VM type, cores, memory), application parameters, and OS/kernel knobs.
+
+A recent survey by Zhao et al.~\cite{autotune_survey} summarizes the main approaches used for automated knob tuning into two interdependent sub-problems:
+\begin{enumerate}
+    \item \textbf{Knob Selection}: identifying the subset of parameters (knobs) that significantly impact performance, thus reducing the dimensionality of the search space.
+    \item \textbf{Tuning Strategy}: the algorithm used to navigate the reduced search space to find the optimal configuration.
+\end{enumerate}
+
+Although different works target different systems (databases, stream processors, cluster managers), many follow the same high-level loop:
+\begin{enumerate}
+    \item Choose a configuration (a vector of knob values).
+    \item Deploy/run under a workload, measure performance.
+    \item Update a search policy/model based on measurements.
+    \item Repeat until a sample budget or convergence is reached.
+\end{enumerate}
+However, the efficiency of this loop is highly dependent on the quality of the initial knob selection.
+An example of autotuning architecture can be found in Figure \ref{fig:autotuning_loop}.
+
+% \begin{figure}
+%     \centering
+%     \includesvg[width=1\linewidth]{images/2_background/knob_autotuining_loop}
+%     \caption{High-level architecture of a typical autotuning framework. The system is divided into a knob identification phase, which filters the search space to find critical parameters, and an online autotuning loop, which iteratively optimizes these parameters using feedback from the target system.}
+%     \label{fig:autotuning_loop}
+% \end{figure}
+
+\begin{figure}[htbp]
+    \centering
+    % Define colors locally for this figure
+    \definecolor{boxblue}{HTML}{DAE8FC}
+    \definecolor{bglightgray}{HTML}{F8F9FA} 
+    \definecolor{nodegray}{HTML}{F0F0F0}    
+
+    % Resize the entire TikZ picture to fit the text width
+    \resizebox{\textwidth}{!}{%
+        \begin{tikzpicture}[
+            >=Stealth,
+            font=\sffamily,
+            % Standard node styles
+            graynode/.style={draw, fill=nodegray, rounded corners=4pt, minimum width=3.2cm, minimum height=1.4cm, align=center},
+            bluenode/.style={draw, fill=boxblue, minimum width=3.2cm, minimum height=1.4cm, align=center},
+            innergray/.style={draw, fill=nodegray, minimum width=2.8cm, minimum height=1cm, align=center}
+        ]
+
+            % ==========================================
+            % 1. BACKGROUND BOUNDING BOXES
+            % ==========================================
+            
+            % Left Box: Knob Identification Phase (Expanded right edge and top edge)
+            \draw[fill=bglightgray, draw=black!70] (-2.0, -0.5) rectangle (11.2, 6.8);
+            \node[anchor=north, font=\bfseries, text=black!80] at (4.6, 6.6) {Knob Identification Phase};
+
+            % Right Box: Autotuning Loop (Expanded top edge)
+            \draw[fill=bglightgray, draw=black!70] (12.8, -5.5) rectangle (22.4, 6.8);
+            \node[anchor=north, font=\bfseries, text=black!80] at (17.6, 6.6) {Autotuning Loop};
+
+
+            % ==========================================
+            % 2. LEFT PHASE: KNOB IDENTIFICATION
+            % ==========================================
+            
+            \node[graynode] (all_knobs) at (0, 2) {All Sysctl Knobs};
+            \node[bluenode] (selector)  at (4.5, 2) {Knob Selector};
+            \node[graynode] (filtered)  at (9, 2) {Filtered Knob Subset};
+
+            \draw[->, thick] (all_knobs) -- (selector);
+            \draw[->, thick] (selector) -- (filtered);
+
+
+            % ==========================================
+            % 3. BIG CONNECTING ARROW
+            % ==========================================
+            
+            % Adjusted to sit perfectly between the two newly sized boxes
+            \filldraw[fill=boxblue, draw=black!80, thick]
+                (11.4, 1.7) -- (12.1, 1.7) -- (12.1, 1.4) -- (12.6, 2.0) -- (12.1, 2.6) -- (12.1, 2.3) -- (11.4, 2.3) -- cycle;
+
+
+            % ==========================================
+            % 4. RIGHT PHASE: AUTOTUNING LOOP
+            % ==========================================
+            
+            % Tuning Controller
+            \node[bluenode] (controller) at (15, 1) {Tuning Controller};
+
+            % Experiment Executor (Nested Node)
+            \node[draw, fill=boxblue, minimum width=3.4cm, minimum height=2.6cm, align=center] (executor) at (15, -3.5) {};
+            \node[anchor=north, yshift=-0.1cm] at (executor.north) {Experiment Executor};
+            \node[innergray, anchor=south, yshift=0.2cm] (wg) at (executor.south) {Workload\\Generator};
+
+            % Target System (Nested Node)
+            \node[draw, fill=boxblue, minimum width=3.4cm, minimum height=2.6cm, align=center] (target) at (20, -3.5) {};
+            \node[anchor=north, yshift=-0.1cm, align=center] at (target.north) {Target System (e.g.,\\DBMS)};
+            \node[innergray, anchor=south, yshift=0.2cm] (wr) at (target.south) {Workload Running};
+
+            % Metrics Collector
+            \node[bluenode] (metrics) at (20, -0.5) {Metrics Collector};
+
+            % Knowledge Base (Cylinder shape)
+            \node[cylinder, draw, fill=nodegray, shape border rotate=90, aspect=0.25, minimum height=1.5cm, minimum width=3.2cm, align=center] (kb) at (20, 2) {Knowledge Base};
+
+            % Configuration Optimizer (Moved up to y=4.8 to avoid overlap)
+            \node[bluenode, minimum height=1.8cm] (optimizer) at (20, 4.8) {Configuration\\Optimizer (e.g.,\\Bayesian\\Optimization, RL)};
+
+
+            % ==========================================
+            % 5. RIGHT PHASE CONNECTIONS (ARROWS)
+            % ==========================================
+            
+            \draw[->, thick] (controller.south) -- (executor.north);
+            \draw[->, thick] (executor.east) -- (target.west);
+            \draw[->, thick] (target.north) -- (metrics.south);
+            \draw[->, thick] (metrics.north) -- (kb.south);
+            \draw[<->, thick] (kb.north) -- (optimizer.south); % Double-headed arrow
+            
+            % Zig-zag from Optimizer down to Controller
+            \draw[->, thick] (optimizer.west) -| (controller.north);
+            
+            % Zig-zag from Metrics Collector up to Controller
+            \draw[->, thick] (metrics.west) -- (17.5, -0.5) -- (17.5, 1) -- (controller.east);
+
+        \end{tikzpicture}%
+    }
+    \caption{System Architecture: Knob Identification Phase and Autotuning Loop}
+    \label{fig:autotuning_loop}
+\end{figure}
+
+% \subsection{Knob Selection Methods}\label{sec:bg-knob-selection}
+% \todo{expand this??}
+%
+% Modern systems (databases, OS kernels) often expose hundreds or thousands of tunable parameters.
+% Tuning high-dimensional spaces is computationally prohibitive due to the curse of \textit{dimensionality}. Consequently, effective knob selection (filtering the search space down to the most impactful parameters) is a prerequisite for successful tuning. Common approaches identified in the literature include:
+% \begin{itemize}
+%     \item \item \textbf{Heuristic and Domain Knowledge}: historically, tuning relied on database administrators (DBAs) or system experts to manually select knobs based on experience or documentation. While simple, this approach is unscalable and prone to human bias, often missing non-intuitive but high-impact knobs.
+%     \item \textbf{Statistical Ranking (e.g., Lasso)}: many frameworks (such as OtterTune~\cite{ottertune}) employ linear regression techniques like \textbf{Lasso (Least Absolute Shrinkage and Selection Operator)}~\cite{lasso}. Lasso applies a regularization penalty that shrinks the coefficients of less important features to zero, effectively performing feature selection. However, these methods typically assume linear correlations between knobs and performance, potentially missing complex non-linear dependencies.
+%     \item \textbf{Feature Importance (Tree-based)}: some approaches utilize ensemble learning methods, such as Random Forests~\cite{random_forests} or Gradient Boosted Decision Trees (GBDT)~\cite{gdbt}. By analyzing the split points in the trees, these models assign an \textit{importance score} to each knob. This captures non-linear interactions better than Lasso but requires significant training data to converge.
+%     \item \textbf{Principal Component Analysis (PCA)}: is occasionally used to reduce dimensionality by transforming correlated knobs into a smaller set of orthogonal principal components. However, this transforms the input space, making the resulting knobs difficult to interpret or map back to actual system parameters.
+% \end{itemize}
+
+\subsection{Taxonomy of Tuning Strategies}\label{sec:bg-tuning-taxonomy}
+
+Following the survey~\cite{autotune_survey}, common tuning strategies can be grouped into:
+\begin{itemize}
+    \item \textbf{Heuristic methods}: hand-designed rules and local search strategies; often simple and robust, but may be sub-optimal and hard to generalize.
+    \item \textbf{Bayesian Optimization (BO)}: sequential model-based optimization using a surrogate model (often a Gaussian process) plus an acquisition function to trade off exploitation and exploration.
+    \item \textbf{Deep learning methods}: supervised or representation-learning-based approaches that predict good configurations from observed metrics and workload signatures.
+    \item \textbf{Reinforcement Learning (RL)}: policy-learning approaches that adapt online; effective in some scenarios but often sample-hungry and sensitive to non-stationarity.
+\end{itemize}
+
+\subsubsection{Heuristic Methods}
+
+Heuristic methods represent the classical approach to database tuning. Unlike learning-based methods that build predictive models of the system behavior, heuristic methods rely on static rules derived from expert knowledge or generic search algorithms to explore the configuration space.
+These approaches are typically \textit{model-free}, they do not attempt to approximate the complex function $f(\theta)$ mapping a configuration $\theta$ to a performance metric.
+Instead, they directly guide the search based on predefined policies or iterative local improvements.
+Following the taxonomy in~\cite{autotune_survey}, heuristic methods can be further categorized into \textit{Rule-Based} tuning and \textit{Search-Based} tuning.
+
+\paragraph{Rule-Based Tuning.} 
+Rule-based tuning is the most traditional form of database configuration, relying heavily on the experience of Engineers and official documentation.
+These methods employ static formulas or logical rules (\textit{rules of thumb}) to set knob values based on hardware characteristics (e.g., total RAM, CPU cores) or workload types.
+A common example is the configuration of the buffer pool size in relational databases. A standard rule might be defined as:
+
+\[\text{buffer\_pool\_size} = \alpha \times \text{Total\_RAM}\]
+
+where $\alpha$ is a static coefficient (e.g., $0.75$ or $0.80$)~\cite{autotune_survey}.
+While such rules ensure a safe baseline configuration, they suffer from significant limitations:
+\begin{itemize}
+  \item \textbf{Lack of Adaptivity}: static rules cannot adapt to the differences of specific workloads. A write-heavy workload requires different tuning than a read-heavy one, even on identical hardware.
+  \item \textbf{Inter-dependency Ignorance}: simple rules often tune knobs in isolation, ignoring the complex, non-linear dependencies between different parameters (e.g., the interaction between log buffer size and commit frequency).
+  \item \textbf{Conservatism}: to ensure stability across all possible scenarios, \textit{vendor-provided} rules are often overly conservative, resulting in a non-optimal configuration.
+\end{itemize}
+
+\paragraph{Search-Based Tuning.}
+Search-based methods, also known as meta-heuristics, treat the tuning problem as a black-box optimization task.
+Instead of relying on static rules, these algorithms iteratively explore the configuration space by generating candidate configurations, measuring their performance, and moving towards more promising regions.
+
+Common algorithms applied in this domain include:
+\begin{itemize}
+  \item \textbf{Hill Climbing (HC)}~\cite{hill_climbing}: a local search algorithm that starts with a random configuration and iteratively changes a single knob. If the change improves performance, the new configuration is adopted. HC is simple but easily trapped in local optima.
+  \item \textbf{Simulated Annealing (SA)}~\cite{simulated_annealing}: An extension of hill climbing that accepts worse configurations with a certain probability (which decreases over time) to escape local optima.
+  \item \textbf{Genetic Algorithms (GA)}: Evolutionary approaches that maintain a population of configurations. New candidates are generated through \textit{crossover} (combining settings from two parent configurations) and \textit{mutation} (randomly altering values).
+\end{itemize}
+
+A state-of-the-art method in this category is BestConfig~\cite{best_config}, which demonstrated that search-based heuristics can sometimes outperform complex machine-learning models.
+BestConfig employs a \textit{Divide-and-Diverge} sampling method to cover the high-dimensional search space and a \textit{Recursive Bound-and-Search} algorithm to refine ranges.
+
+The primary advantage of search-based heuristics is that they are model-free, they do not require a training phase or a pre-collected dataset, making them applicable to a new database instance immediately.
+However, they are often sample-inefficient.
+Since they do not ``learn'' the performance surface, they may require hundreds of iterations (and thus hundreds of database restarts or benchmark runs) to converge, which is often prohibitive in production environments.
+
+\subsubsection{Bayesian Optimization Method}\label{sec:bg-bo}
+
+Bayesian Optimization (BO) is a powerful sequential design strategy for global optimization of black-box functions.
+In the context of database tuning, the objective function $f: \mathcal{X} \to \mathbb{R}$ maps a configuration vector $\mathbf{x}$ (the set of knob values) to a performance metric $y$ (e.g., throughput or latency).
+The tuning problem can be formally stated as finding the configuration $\mathbf{x}^*$ that maximizes the metric:
+
+\[\mathbf{x}^* = \operatorname*{argmax}_{\mathbf{x} \in \mathcal{X}} f(\mathbf{x})\]
+
+Since evaluating $f(\mathbf{x})$ requires running a benchmark on the database system, a process that is computationally expensive and time-consuming, BO is preferred over brute-force or evolutionary methods because it is heavily \textit{sample-efficient}.
+It attempts to find the optimum with the fewest number of function evaluations (iterations) by building a probabilistic surrogate model.
+
+\paragraph{Gaussian Processes (The Surrogate Model).}
+Most tuning frameworks, including OtterTune~\cite{ottertune} and iTuned~\cite{ituned}, employ a Gaussian Process (GP) as the surrogate model. A GP is a non-parametric model defined by a mean function $m(\mathbf{x})$ and a covariance function (kernel) $k(\mathbf{x}, \mathbf{x}')$.
+
+\[f(\mathbf{x}) \sim \mathcal{GP}(m(\mathbf{x}), k(\mathbf{x}, \mathbf{x}'))\]
+
+The kernel function $k(\mathbf{x}, \mathbf{x}')$ encodes the assumption that configurations which are close in the search space should yield similar performance metrics.
+A common choice in database tuning is the Matern $5/2$ kernel or the Radial Basis Function (RBF).
+Given a set of observed configurations and their performance metrics $\mathcal{D}_t = \{(\mathbf{x}_1, y_1), \dots, (\mathbf{x}_t, y_t)\}$, the GP predicts the performance distribution for a new, unseen configuration $\mathbf{x}$.
+The posterior distribution follows a Gaussian $P(f(\mathbf{x}) | \mathcal{D}_t) = \mathcal{N}(\mu_t(\mathbf{x}), \sigma_t^2(\mathbf{x}))$, where the predictive mean $\mu_t(\mathbf{x})$ represents the expected performance, and the variance $\sigma_t^2(\mathbf{x})$ represents the uncertainty of the model at point $\mathbf{x}$.
+
+\paragraph{Acquisition Functions.}
+The true power of BO lies in how it selects the next configuration to evaluate.
+It does not simply select the point with the highest predicted mean (which would lead to pure exploitation).
+Instead, it optimizes an \textit{acquisition function} $a(\mathbf{x})$ that balances two competing goals:
+\begin{itemize}
+  \item \textbf{Exploitation:} Sampling points where the surrogate model predicts high performance (high $\mu_t(\mathbf{x})$).
+  \item \textbf{Exploration:} Sampling points where the model uncertainty is high (high $\sigma_t(\mathbf{x})$), to learn more about the search space.
+\end{itemize}
+A standard acquisition function used in tuning literature is the \textbf{Upper Confidence Bound (UCB)}. For a maximization problem, UCB is defined as:
+
+\[a_{\text{UCB}}(\mathbf{x}; \beta) = \mu_t(\mathbf{x}) + \sqrt{\beta} \cdot \sigma_t(\mathbf{x})\]
+
+where $\beta$ is a hyperparameter controlling the trade-off between exploration and exploitation. Other common functions include \textbf{Expected Improvement (EI)}, which calculates the probability that a new point will exceed the current best observation $f(\mathbf{x}^+)$.
+At each iteration $t$, the tuning system selects the next configuration by maximizing this cheap-to-evaluate proxy function:
+
+\[\mathbf{x}_{t+1} = \operatorname*{argmax}_{\mathbf{x} \in \mathcal{X}} a(\mathbf{x})\]
+
+\paragraph{High-Dimensionality and Scalability Challenges.}
+While BO is the state-of-the-art for low-dimensional problems, the survey by Zhao et al.~\cite{autotune_survey} identifies ``the curse of dimensionality'' as a critical bottleneck for system tuning.
+Standard GPs scale poorly with the number of observations $N$, requiring $\mathcal{O}(N^3)$ time for matrix inversion during model fitting.
+More importantly, the search efficiency degrades exponentially as the number of tuning knobs (dimensions) increases.
+
+Databases often possess hundreds of tunable parameters (e.g., MySQL has $>500$ system variables).
+Standard BO is typically effective only up to $15$--$20$ dimensions.
+To address this, modern tuning systems must employ dimensionality reduction techniques before applying Bayesian optimization.
+For example, OtterTune uses Lasso regression to select the most significant knobs, reducing the search space to a manageable size before the GP optimization phase begins.
+Without such pruning, BO fails to converge within a reasonable time frame for high-dimensional configuration spaces.
+
+\begin{figure}[htpb]
+    \centering
+    \begin{tikzpicture}[
+        >=Stealth,
+        font=\sffamily,
+        % Styles for the blocks
+        surrogate/.style={
+            regular polygon, 
+            regular polygon sides=6,
+            draw=black, 
+            fill=blue!10,
+            align=center,
+            inner sep=-4pt, % Pulls the borders tighter to the text
+            minimum size=2.8cm % Significantly reduced size
+        },
+        acqbox/.style={
+            rectangle, 
+            rounded corners=5pt,
+            draw=black, 
+            fill=blue!10,
+            text width=3.5cm, 
+            align=center,
+            minimum height=1.5cm,
+            inner sep=5pt
+        },
+        evalbox/.style={
+            rectangle, 
+            rounded corners=5pt,
+            draw=black, 
+            fill=gray!10,
+            text width=3.5cm, 
+            align=center,
+            minimum height=1.5cm,
+            inner sep=5pt
+        },
+        labeltext/.style={
+            font=\sffamily\small,
+            align=center
+        }
+    ]
+    
+    % Force symmetric bounding box so \centering works perfectly on the (0,y) axis
+    \path (-6.5, 0) -- (6.5, 0);
+    
+    % 1. Place the Nodes
+    % Made fonts smaller here to allow the hexagon to shrink
+    \node[surrogate] (surrogate) at (0, 0) {\small Surrogate Model \\[-0.3em] \scriptsize (Gaussian Process, \\[-0.3em] Random Forest)};
+    
+    \node (init) at (0, 3) {Initial Random Data};
+    
+    \node[evalbox] (evaluate) at (0, -5) {Evaluate Process};
+    
+    \node[acqbox] (acquisition) at (-4, -2.5) {Acquisition Function \\ (Expected \\ Improvement)};
+    
+    \node (optimal) at (0, -7.5) {Optimal Configuration};
+    
+    % 2. Draw the Edges
+    % Initial to Surrogate
+    \draw[->] (init) -- (surrogate);
+    
+    % Surrogate to Evaluate (Dashed center line)
+    \draw[->, dashed] (surrogate) -- node[fill=white, labeltext] {Surrogate of} (evaluate);
+    
+    % Evaluate to Optimal
+    \draw[->] (evaluate) -- (optimal);
+    
+    % Surrogate to Acquisition (Curved left)
+    \draw[->] (surrogate.west) to[out=180, in=90] (acquisition.north);
+    
+    % Acquisition to Evaluate (Curved bottom-left)
+    \draw[->] (acquisition.south) to[out=-90, in=180] 
+        node[pos=0.4, left=0.2cm, labeltext] {Most Promising \\ Configuration} 
+        (evaluate.west);
+    
+    % Evaluate to Surrogate (Curved right)
+    \draw[->] (evaluate.east) to[out=0, in=0, looseness=1.5] 
+        node[pos=0.5, right=0.2cm, labeltext, text width=2.2cm] {Update Surrogate Model} 
+        (surrogate.east);
+    
+    \end{tikzpicture}
+    \caption{Schematic of the Bayesian optimization approach \cite{bayesian_process}.}
+    \label{fig:bayesian_optimization}
+\end{figure}
+
+\subsubsection{Deep Learning Methods}
+
+While Bayesian Optimization is effective for low-dimensional spaces, its computational complexity ($\mathcal{O}(N^3)$) and inability to capture high-order feature interactions limit its scalability.
+Deep Learning (DL) methods address these limitations by utilizing deep neural networks (DNNs) to approximate the performance function $f: \mathcal{X} \times \mathcal{W} \to \mathbb{R}$, where $\mathcal{X}$ is the configuration space and $\mathcal{W}$ represents the workload features.
+
+Unlike heuristics that rely on static rules, DL-based approaches are primarily supervised learning techniques.
+They require a substantial training dataset $\mathcal{D} = \{(\mathbf{x}_i, \mathbf{w}_i, y_i)\}$, consisting of:
+\begin{itemize}
+  \item Configuration parameters.
+  \item Workload characteristics.
+  \item Observed performance metrics.
+\end{itemize}
+
+\paragraph{Workload Characterization and Performance Prediction.}
+The primary contribution of DL in this domain is its ability to learn rich representations of workloads, which is critical because the optimal configuration $\mathbf{x}^*$ is highly workload-dependent.
+\begin{itemize}
+  \item \textbf{Query Featurization}: Early methods relied on aggregated metrics (e.g., read/write ratios). State-of-the-art approaches, such as QTune~\cite{qtune}, employ Deep Learning to analyze the SQL text directly. They utilize Natural Language Processing (NLP) techniques—specifically Recurrent Neural Networks (RNNs) or Transformers—to map variable-length SQL queries into fixed-length feature vectors (query embeddings).
+  \item \textbf{Performance Prediction}: Once the workload is vectorised, a Multi-Layer Perceptron (MLP) is typically used as a regression model to predict the performance metric $y$ (e.g., latency or throughput) given a configuration $\mathbf{x}$.
+\end{itemize}
+
+\paragraph{Advantages and Disadvantages.}
+The main advantage of DL is its capacity to handle high-dimensional input spaces without manual feature engineering.
+However, DL methods suffer from the cold-start problem: training a reliable DNN requires thousands of labeled data points.
+Since collecting a single data point requires running a benchmark on a real database (taking minutes or hours), generating a sufficient dataset for pure supervised learning is often computationally prohibitive.
+
+\subsubsection{Reinforcement Learning Methods}\label{sec:bg-rl}
+
+Reinforcement Learning (RL) frames tuning as a sequential decision-making process.
+Unlike supervised learning, which passively predicts performance, RL agents actively learn a tuning policy $\pi$ by interacting with the environment to maximize a cumulative reward (e.g., throughput improvement).
+
+Formally, the tuning problem is modeled as a Markov Decision Process (MDP) defined by the tuple $(\mathcal{S}, \mathcal{A}, \mathcal{R}, \mathcal{P}, \gamma)$:
+\begin{itemize}
+  \item \textbf{State} $\mathcal{S}$: a vector representing the current internal metrics of the DBMS (e.g., cache hit ratios, lock wait times, current knob values).
+  \item \textbf{Action} $\mathcal{A}$: a vector of continuous values representing the changes to apply to the configuration knobs.
+  \item \textbf{Reward} $\mathcal{R}$: the feedback signal derived from the performance change, often defined as $\Delta \text{throughput}$ or $-\Delta \text{latency}$.
+\end{itemize}
+
+\paragraph{Continuous Control with DDPG.}
+
+A major challenge in system tuning is that configuration knobs are continuous (e.g., buffer size can be any integer between 128MB and 64GB).
+Traditional RL algorithms like Q-Learning (DQN) are designed for discrete action spaces and cannot easily handle hundreds of continuous parameters.
+
+To resolve this, state-of-the-art systems like CDBTune~\cite{cdbtune} employ the Deep Deterministic Policy Gradient (DDPG) algorithm.
+DDPG is an Actor-Critic method:
+\begin{itemize}
+  \item \textbf{Actor Network} $\mu(s|\theta^\mu)$: deterministically outputs the exact continuous knob values (action) given the current state.
+  \item \textbf{Critic Network} $Q(s, a|\theta^Q)$: Estimates the expected future reward (Q-value) of taking action $a$ in state $s$.
+\end{itemize}
+By using the Critic to guide the Actor, DDPG allows the system to navigate the high-dimensional continuous space efficiently.
+
+\paragraph{End-to-End Tuning.}
+RL methods like CDBTune are noted for being ``end-to-end''.
+They do not require the separate knob selection or workload characterization steps seen in BO or heuristic methods.
+Instead, the agent learns to identify which metrics (State) correlate with performance (Reward) purely through trial-and-error.
+
+\paragraph{Limitations.}
+The survey~\cite{autotune_survey} highlights two critical issues with reinforcement learning:
+\begin{enumerate}
+  \item \textbf{Sample Efficiency}: RL agents are notoriously sample-hungry, often requiring thousands of tuning samples to converge, which can take days on a real system.
+  \item \textbf{Safety}: During the exploration phase, an RL agent may select dangerous configurations that crash the database or severely degrade performance.
+\end{enumerate}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Comparison of Database Knob Tuning Methods.~(adapted from~\cite{autotune_survey})}\label{tab:tuning-comparison}
+  \resizebox{\textwidth}{!}{
+  \begin{tabular}{@{}lcccc@{}}
+  \toprule
+  \textbf{Feature} & \textbf{Heuristic Rules} & \textbf{Bayesian Opt. (BO)} & \textbf{Deep Learning (DL)} & \textbf{Reinforcement Learning (RL)} \\ \midrule
+  \textbf{Core Mechanism} & Static formulas / Local Search & Probabilistic Surrogate (GP) & Supervised Regression & Trial-and-Error (MDP) \\
+  \textbf{Model-Free/Based} & Model-Free & Model-Based & Model-Based & Model-Free (mostly) \\
+  \textbf{Setup Time} & Instant (Zero-shot) & Low & High (Training required) & High (Training required) \\
+  \textbf{Sample Efficiency} & High & High (Very few samples needed) & Low (Needs large dataset) & Very Low (Sample hungry) \\
+  \textbf{Search Capability} & Local (prone to local optima) & Global (balance exploit/explore) & Global (via prediction) & Global (via policy exploration) \\
+  \textbf{Dimensionality} & Unlimited & Low ($<30$ knobs) & High & High (with DDPG) \\
+  \textbf{Workload Awareness} & None (Static) & Implicit (via observations) & Explicit (SQL Featurization) & Implicit (via State-Reward) \\
+  \textbf{Primary Limitation} & Rigid / Sub-optimal & Scalability ($\mathcal{O}(N^3)$ cost) & Cold-start Problem & Unsafe Exploration \\
+  \textbf{Representative Tools} & MySQLTuner, BestConfig & OtterTune, iTuned & QTune & CDBTune, UDO \\ \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\subsection{Knob Selection Strategies}\label{sec:bg-knob-selection}
+
+Modern systems (databases, OS kernels) often expose hundreds or thousands of tunable parameters.
+As discussed in Section~\ref{sec:bg-bo}, many optimization algorithms, particularly Gaussian Process-based Bayesian Optimization, suffer severely from the \textit{curse of dimensionality}.
+The search space grows exponentially with the number of tunable knobs, making it computationally infeasible to tune all parameters simultaneously.
+Furthermore, tuning irrelevant or dangerous knobs can lead to instability without providing performance gains.
+
+To address this, state-of-the-art tuning systems employ a Knob Selection (or Feature Selection) phase to reduce the high-dimensional configuration space $\mathcal{X}_{full}$ to a lower-dimensional subspace $\mathcal{X}_{active}$ (typically $|\mathcal{X}_{active}| \approx 10 \dots 20$) containing only the most impactful parameters.
+Following the survey~\cite{autotune_survey}, these strategies can be categorized into static filtering and learning-based ranking.
+
+\subsubsection{Static and Heuristic Filtering}
+
+The simplest approach relies on domain knowledge and static rules to prune the search space before any learning occurs.
+\begin{itemize}
+  \item \textbf{Type-based Pruning}: parameters that do not impact performance metrics are discarded immediately. These include string-based configuration (e.g., file paths like \texttt{log\_error}), boolean flags for debugging, and read-only variables that cannot be changed at runtime.
+  \item \textbf{Restart-based Pruning}: some tuning systems, such as \textbf{CDBTune}, distinguish between dynamic knobs (changeable online) and static knobs (requiring a restart). To avoid the high cost of restarting the DBMS during the tuning loop, some policies exclude static knobs entirely, though this limits the potential performance gain~\cite{cdbtune}.
+  \item \textbf{Expert Lists}: DBAs often maintain black lists of dangerous knobs (e.g., those disabling ACID guarantees like \texttt{fsync=off}) and white lists of high-impact knobs (e.g., buffer pool sizes). While safe, this approach is often overly conservative and fails to generalize across different hardware or workload types.
+\end{itemize}
+
+\subsubsection{Learning-Based Ranking}
+% \todo{sampling and ranking}
+% \todo{lhs (latin hypercube),  Plackett \& Burman, Sensitivity Analysis (SA)}
+
+To overcome the limitations of static rules, modern systems employ statistical learning to identify which knobs significantly impact the current workload.
+An example is OtterTune~\cite{ottertune}, which uses Lasso (Least Absolute Shrinkage and Selection Operator)~\cite{lasso} regression.
+Lasso is a linear regression method that introduces an $\ell_1$ regularization penalty, forcing the coefficients of less important features to become exactly zero.
+Given a dataset of $N$ configurations and their resulting performance metrics, OtterTune fits a Lasso model:
+
+\[\hat{\boldsymbol{\beta}} = \operatorname*{argmin}_{\boldsymbol{\beta}} \left( \sum_{i=1}^{N} (y_i - \boldsymbol{\beta}^T \mathbf{x}_i)^2 + \lambda \sum_{j=1}^{p} |\beta_j| \right)\]
+
+where $\boldsymbol{\beta}$ represents the importance weight of each knob.
+By tuning the regularization parameter $\lambda$, the algorithm increases sparsity, effectively selecting a subset of $k$ non-zero coefficients.
+These correspond to the $k$ most impactful knobs for the specific workload being tuned.
+However, these methods typically assume linear correlations between knobs and performance, potentially missing complex non-linear dependencies.
+
+\subsubsection{Tree-Based Importance}
+
+Alternative approaches utilize tree-based ensemble methods, such as Random Forests~\cite{random_forests} or Gradient Boosted Trees~\cite{gbdt}.
+Unlike linear models (Lasso), tree-based methods can capture non-linear dependencies and feature interactions.
+Feature importance is calculated by averaging the \textit{impurity decrease} (e.g., Gini impurity or variance reduction) caused by splitting on a specific knob across all trees in the forest.
+While computationally more expensive than Lasso, tree-based ranking is robust against multicollinearity (highly correlated knobs) and is used in systems like \textbf{ResTune}.
+
+% \subsection{Representative autotuning systems}\label{sec:bg-systems}
+% \todo{explain better SOA methods}
+
+% This section briefly summarizes representative systems mentioned in the literature overview that inspired this thesis.
+
+% \paragraph{OtterTune (databases).}
+% OtterTune~\cite{ottertune} targets DBMS tuning and integrates both metric analysis and knob selection. It:
+% \begin{enumerate}
+%     \item collects internal DBMS metrics to characterize workloads.
+%     \item prunes redundant metrics via clustering and dimensionality reduction.
+%     \item uses feature selection (e.g., Lasso paths~\cite{lasso}) to identify influential knobs.
+%     \item applies a BO-style optimizer.
+% \end{enumerate}
+% A recurring theme is that the full configuration space is too large: effective tuning depends on identifying a smaller set of important knobs.
+
+% \paragraph{SelfTune (cluster managers).}
+% SelfTune~\cite{selftune_nsdi2023} treats the cluster manager as a parametrized control system.
+% It exposes a developer-specified knob interface, continuously measures a reward, and adapts parameters online with a learning algorithm designed for stability in production.
+
+% \paragraph{Tuning recurring streaming jobs.}
+% COTuner~\cite{cotuner} optimizes both cloud resources and software parameters for recurring streaming jobs.
+% A limitation noted in the overview is that some approaches rely on developer-provided search spaces without deeply identifying which knobs matter most.
+
+% \paragraph{Database tuning via multi-task learning.}
+% OBTune~\cite{obtune} applies multi-task learning across workloads to tune database knobs.
+% Similarly to other methods, effectiveness depends on appropriately capturing workload similarity and identifying influential parameters.
+
+% \paragraph{Knob importance and pruning.}
+% Several works (e.g., KnobTune and VDTuner) incorporate importance analysis and runtime knob pruning~\cite{vdtuner,knobtune}.
+% These ideas align with the thesis goal of reducing the effective tuning space.
+
+% \paragraph{RL-based tuning.}
+% RL-based methods such as DeepCAT+ and CDBTune~\cite{deepcat_plus,cdbtune} can be effective within the training distribution, but often face challenges when the workload or application changes.
+% This motivates approaches that are more sample-efficient and that explicitly address transfer and generalization.
+
+% \subsection{Performance prediction in ``black-box'' clouds}\label{sec:bg-cloudprophet}
+
+% Although the core of this thesis targets kernel knob selection, performance prediction in public clouds is closely related because it relies on limited observability.
+% CloudProphet~\cite{cloudprophet} aims to predict application performance within public cloud virtual machines using host-observable metrics (CPU, cache, memory, storage, network) and machine learning.
+% The broader takeaway is that tuning and prediction systems must often operate with partial signals and still remain robust to changing workloads.
+
+% \section{OCLOZ}\label{sec:bg-ocloz}
+% \todo{change title}
+% \todo{descrbie their bayesian optimization. Very quickly the RL}
+
+\section{Key Challenges in Knob Autotuning}\label{sec:bg-challenges}
+
+Synthesizing the literature presented in this chapter, it becomes evident that while automated knob tuning has made significant progress, several fundamental challenges consistently limit its effectiveness and applicability across different domains:
+\begin{itemize}
+    \item \textbf{High-dimensional, mixed-type search spaces}: knobs can be continuous, discrete, boolean, and categorical; interactions are common.
+    \item \textbf{Noisy measurements and non-stationarity}: performance varies due to background activity, changing inputs, and evolving software stacks.
+    \item \textbf{Budget constraints}: each trial may require minutes of runtime; production systems cannot afford extensive exploration.
+    \item \textbf{Generalization and transfer}: models trained on one workload/version may not hold under updates.
+    \item \textbf{Identify what matters}: the vast majority of knobs are irrelevant to a given workload; including them slows learning and increases noise.
+\end{itemize}
+
+\begin{itemize}
+    \item \textbf{High-dimensional, mixed-type search spaces}: configuration spaces are massive and heterogenous. Knobs can be continuous (e.g., memory limits), discrete (e.g., thread counts), boolean (e.g., feature toggles), or categorical (e.g., scheduling algorithms). Furthermore, these knobs rarely operate in isolation; complex, non-linear interactions between them make modelling the search space exceedingly difficult.
+    \item \textbf{Noisy measurements and non-stationarity}: Performance evaluations are rarely deterministic. The observed performance of a given configuration often fluctuates due to uncontrollable factors such as background system activity, dynamic and unpredictable incoming workloads, and evolving hardware or software stacks over time.
+    \item \textbf{Budget constraints}: evaluating a single configuration requires applying the changes and running a representative benchmark. Because each trial may take minutes or even hours to produce stable metrics, production systems cannot afford the extensive exploration required by traditional search algorithms. The tuning budget is strictly limited.
+    \item \textbf{Generalization and transfer}: machine learning models trained to predict optimal configurations often over fit to a specific hardware environment, workload, or software version. When the system updates or the workload profile changes, the learned models degrade, requiring expensive retraining phases.
+    \item \textbf{Identifying what matters}: the vast majority of available knobs are entirely irrelevant to any single, specific workload. Including these irrelevant parameters in the tuning process unnecessarily inflates the search space (the "curse of dimensionality"), exponentially slowing down the learning algorithm and introducing statistical noise.
+\end{itemize}
+
+\section{Positioning of This Thesis}\label{sec:bg-positioning}
+
+The survey by Zhao et al.~\cite{autotune_survey} highlights that modern, state-of-the-art autotuning systems heavily rely on dimensionality reduction, workload characterization, and careful feature selection to overcome the aforementioned challenges.
+However, a critical limitation emerges from the current literature: the overwhelming majority of existing research focuses exclusively on application-level tuning.
+
+Whether optimizing databases~\cite{autotune_survey}, web servers, or language virtual machines, current automated tuners operate almost entirely within user space.
+There is a distinct lack of research extending these automated tuning methodologies to the underlying operating system.
+The Linux kernel dictates the foundational performance, resource allocation, and networking efficiency of all user-space applications.
+However, its massive configuration space remains largely untouched by automated tuners due to its inherent complexity and the high risk of system-wide instability.
+
+This thesis explicitly addresses this gap by focusing on the knob-selection problem at the OS level.
+Rather than relying solely on the expensive trial-and-error runtime observations favoured by application-level tuners, a more principled approach is proposed.
+We investigate how static analysis can be utilized to expose the structural links between application-visible behaviour (specifically, the system calls issued by a workload) and the internal kernel code and configuration paths that govern performance-critical subsystems.
+By mapping these dependencies, the aim is to systematically prune the kernel search space, isolating only the configuration knobs that directly impact the execution of the target application.
+
+\newpage

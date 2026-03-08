@@ -1,0 +1,19 @@
+\chapter*{Abstract} \label{abtract}
+
+\addcontentsline{toc}{chapter}{Abstract} % add to index
+
+Modern cloud infrastructures increasingly host specialized, single-application workloads, but these systems still run on a general-purpose Linux kernel configured through broad default \textit{sysctl} settings.
+While safe and portable, default configurations are often suboptimal for high-performance services, and manual tuning is impractical due to the large configuration space and the complex interactions among kernel parameters.
+This thesis addresses that gap by proposing an application-agnostic methodology to identify, before optimization, only the kernel knobs that can materially affect a target workload.
+
+The core contribution is a static analysis pipeline that combines two complementary views of kernel behaviour: a top-down reconstruction of execution paths activated by application system calls, and a bottom-up analysis of where and how \textit{sysctl} knobs are evaluated along those paths.
+Their intersection produces a reduced, execution-relevant subset of tunables, transforming a high-dimensional search space into a reduced set suitable for automated optimization.
+
+The methodology is implemented and evaluated on real web-server workloads, then coupled with Bayesian Optimization for parameter search.
+Experimental results show substantial throughput gains across different architectures, with improvements up to 23\% for Apache HTTP Server and around 15\% for NGINX and HAProxy.
+Beyond aggregate gains, the study confirms that the central thesis idea works in practice: static kernel-path analysis can effectively guide autotuning toward meaningful performance improvements.
+The results also show that optimal kernel configurations are workload- and architecture-dependent, as thread-oriented and event-driven servers expose different bottlenecks and therefore require different tuning strategies.
+
+Overall, this work bridges static operating system analysis and autotuning by demonstrating that relevant kernel search spaces can be derived systematically from kernel execution semantics. The proposed approach provides a practical foundation for scalable, autonomous kernel tuning in modern virtualized environments.
+
+\newpage

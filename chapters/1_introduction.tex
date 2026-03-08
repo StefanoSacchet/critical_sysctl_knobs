@@ -1,0 +1,61 @@
+\chapter{Introduction}
+\label{ch:introduction}
+
+\section{Context: The Shift to Specialized Workloads}
+
+The architecture of modern computing has undergone a fundamental paradigm shift. While traditional servers once hosted multiple distinct users and applications simultaneously, acting as shared utilities, today's infrastructure is increasingly dominated by virtualized environments, such as Virtual Machines (VMs) and containers, dedicated to running a single application or micro-service. In this model, the boundaries between the application and the underlying operating system are conceptually blurring. The operating system is no longer just a resource arbitrator for competing users, but a dedicated runtime environment for a specific task, such as a \textit{Redis} cache, an \textit{Nginx} web server, or a specialized database node \cite{shift_to_microservices}.
+
+However, despite this shift toward specialization, the underlying operating system remains the \textbf{Linux Kernel}, a massive, monolithic piece of software designed for extreme general-purpose use. Linux is engineered to run on everything from embedded IoT devices to supercomputers, and to support workloads ranging from desktop GUIs to high-frequency trading platforms. To achieve this universality, the kernel exposes a vast array of configuration parameters, allowing administrators to modify its behaviour at runtime \cite{kernel_parameters}.
+
+This creates a significant inefficiency in modern cloud infrastructure: highly specialized single-application VMs are forced to run on top of generic, \textit{"one-size-fits-all"} suboptimal kernel configurations. The default settings of the Linux Kernel are chosen to be safe and functional for the widest possible range of hardware and software, effectively aiming for a "lowest common denominator" of performance. For instance, the default TCP buffer sizes and congestion control algorithms in Linux are often tuned for standard internet traffic, which may physically prevent a high-throughput internal micro-service from utilizing the full bandwidth of a 100 Gbps data center link. As noted by recent studies on kernel optimization, for a dedicated virtual machine these defaults are often grossly inefficient, leading to resource underutilization, increased latency, and unnecessary energy consumption \cite{unikernels}.
+
+\section{The Linux Kernel Configuration Space}
+
+The interface for tuning the Linux Kernel is primarily exposed through \textbf{sysctl}, a mechanism that allows administrators to read and modify kernel parameters at runtime. These parameters, often referred to as \textbf{"knobs"}, control critical subsystems including networking (TCP/IP stack buffers, timeouts, congestion control), memory management (swappiness, dirty page ratios), and process scheduling. As the Linux Kernel has grown in complexity, so has the number of these knobs. In modern kernel versions (e.g., 5.x or 6.x), there are more than 2,000 distinct \textit{sysctl} parameters.
+
+\begin{itemize}
+    \item \textbf{Networking}: parameters such as \textit{net.core.rmem\_max} or \textit{net.ipv4.tcp\_keepalive\_time} dictate how the kernel handles network packets.
+    \item \textbf{Virtual Memory}: knobs like \textit{vm.swappiness} control how aggressively the kernel swaps memory to disk.
+    \item \textbf{File System}: parameters limit the number of open file descriptors or control asynchronous I/O behaviour.
+\end{itemize}
+
+Although this configurability offers immense power, it presents a significant engineering challenge. The relationship between these knobs and application performance is non-linear and often opaque. A parameter that improves throughput for a database might cause latency spikes for a web server. Furthermore, these knobs often interact with each other. Changing a buffer size in the core network layer may have no effect unless a corresponding limit in the TCP layer is also adjusted.
+
+\section{The Problem: The Infeasibility of Manual Tuning}
+
+Given the complexity described above, manual tuning of kernel parameters for specific workloads is becoming effectively impractical at scale \cite{kml2021,stun2022}. This problem can be decomposed into three specific challenges:
+
+\begin{itemize}
+    \item \textbf{Dimensionality}: with thousands of available parameters, the search space for an optimal configuration is combinatorially explosive \cite{stun2022}. A human engineer cannot manually test every combination of values.
+    \item \textbf{Opacity}: it is rarely obvious which knobs are relevant to a specific application \cite{kml2021}. A developer deploying a Node.js application may know their code, but they likely do not know which specific kernel TCP settings interact with the V8 engine garbage collector or networking libraries.
+    \item \textbf{Volatility}: Optimal settings are not static; they depend on the specific hardware generation, the version of the kernel, and the exact characteristics of the workload (e.g., read-heavy vs. write-heavy) \cite{kml2021}. A configuration manually tuned for one version of an application may become obsolete when the application is updated.
+\end{itemize}
+
+Consequently, most deployments rely on default settings or rule-of-thumb scripts found online, leaving significant performance gains on the table \cite{kml2021,stun2022}.
+
+\section{The Need for Autotuning}
+
+To bridge the gap between specialized workloads and the general-purpose kernel, there is a critical need for Autotuning, automated systems capable of finding optimal configurations without human intervention \cite{stun2022,bestconfig2017,cherrypick2017}.
+
+In recent years, researchers have proposed various frameworks using machine learning, specifically Reinforcement Learning (RL) and Bayesian Optimization, to automate this process \cite{stun2022,bestconfig2017,cherrypick2017}. These systems treat the kernel as a "black box" or "grey box", observing the system performance metrics (e.g., throughput, latency) and iteratively adjusting knobs to maximize a reward function.
+
+However, a major bottleneck remains: The Search Space \cite{bestconfig2017,cherrypick2017}. Reinforcement learning algorithms suffer from the curse of dimensionality. If an autotuner attempts to explore all 2,000+ available kernel knobs, the time required to converge on a solution becomes prohibitive. Most knobs in the kernel will have absolutely no impact on a specific single-application workload (e.g., tuning USB drivers for a cloud database). Including these irrelevant knobs in the learning process adds noise and drastically slows down the optimization.
+
+To make autotuning viable for production VMs, the system must first answer a fundamental question: Which specific subset of the thousands of available knobs actually impacts the application running right now?
+
+\section{Thesis Statement and Contributions}
+
+This thesis addresses the "Search Space" problem in kernel autotuning. I argue that \textbf{static analysis} of the Linux kernel source code, when properly enhanced to handle the kernel complex structure, can identify links between an application system calls and the kernel knobs that govern them. By filtering out irrelevant parameters before the tuning process begins, we can massively reduce the dimensionality of the problem.
+
+The contributions of this work are as follows:
+\begin{enumerate}
+    \item \textbf{A Novel Static Analysis Methodology}: I present an LLVM-based static analysis toolchain specifically designed to construct the call graph of the Linux kernel. Unlike standard tools, this methodology addresses kernel-specific challenges such as use--def chains and deep pointer indirection.
+    \item \textbf{Resolution of Indirect Calls}: A primary limitation of existing analysis tools is the inability to trace function pointers, which are ubiquitous in the Linux kernel (e.g., the Virtual File System and socket layers). This work proposes a heuristic strategy to resolve these indirect calls, effectively linking high-level system calls (e.g., \texttt{write} or \texttt{read}) to the specific protocol layers (e.g., TCP or UDP) that contain the relevant tuning knobs.
+    \item \textbf{Data-Flow Graphs for \textit{sysctl} Knobs}: I introduce a data-flow-graph-based representation that links \textit{sysctl} parameters to the kernel variables and control paths they influence, enabling a principled mapping from knobs to affected subsystems.
+    \item \textbf{Search Space Reduction}: I demonstrate that this targeted analysis reduces the search space from thousands of generic knobs to a precise, workload-specific subset.
+    \item \textbf{Framework Independence}: While this work was validated using an autotuning framework as a testbed, the proposed static analysis method is generic. It serves as a foundational preprocessing step that can accelerate any autotuning or optimization framework by providing a high-quality feature selection mechanism.
+\end{enumerate}
+
+By addressing this static-analysis gap, this thesis paves the way for efficient, automated optimization of VMs and microservices, ensuring that the general-purpose Linux kernel can be tailored to the needs of modern applications.
+
+\newpage

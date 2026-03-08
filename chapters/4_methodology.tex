@@ -1,0 +1,763 @@
+\chapter{Methodology} \label{ch:methodology}
+
+% \begin{itemize}
+%     \item explain core idea: the goal is to find critical sysctl knobs that can affect application performance. Applications interact with the kernel through syscalls, so we need to track syscalls paths in the kernel and also track how a given knob propagates in the kernel (the functions it touches). This way we can understand which knobs may affect the syscalls and thus the application.
+%     \item explain "knob analyzer" the framework (not my work) that tracks how a knob propagates in the kernel and builds a call graph with all functions it touches.
+%     \item explain the dfg tracing I built on top of the "knob analyzer" to also have all global variables where the knob propagates.
+%     \item explain static analysis, pointer vs type analysis??
+%     \item explain "syscall analyzer": the framework I built, on top of SMLTA (strong multilayer type analysis) and why I chose it, that generates top-down call graphs for a given syscall. The focus was on the networking subsystem, to prove that the idea was working. Resolving Indirect Calls, The "Pruning" Strategy, Logic for identifying the workload type (e.g., specific syscalls used). Filtering unreachable paths (e.g., if workload uses TCP, prune UDP branches in the static graph). Result: A directed graph linking specific System Calls $\to$ Kernel Functions.
+%     \item Intersect sysctl knob call graphs to system calls call graphs to get list of critical knobs.
+%     \item show the entire system architecture adding figures, where possible, to better explain everything.
+% \end{itemize}
+
+\section{Core Rationale}
+
+The primary objective of this research is to systematically identify critical \textit{sysctl} knobs within the Linux kernel that have a tangible impact on the performance of generic user-space applications.
+Modern applications interact with the underlying operating system almost exclusively through System Calls (syscalls).
+Consequently, the execution path that a system call takes through the kernel dictates the performance and behaviour of the application that invokes it.
+
+Conversely, the Linux kernel provides administrators with dynamic configuration points known as \textit{sysctl} knobs.
+Modifying these knobs, as shown in Figure~\ref{fig:sysctl_architecture} alters the internal kernel variables, thus changing the execution logic of various subsystems.
+To accurately determine which knobs affect a specific application, we must bridge the gap between user-space requests and kernel-space configurations.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{tikzpicture}[
+        % Define styles for different elements
+        basicbox/.style={rectangle, draw, thick, rounded corners, text centered, minimum height=3em, font=\small},
+        userbox/.style={basicbox, fill=blue!10, text width=6em},
+        kernelbox/.style={basicbox, fill=red!10, text width=7em},
+        knobbox/.style={rectangle, draw=orange!80!black, thick, fill=orange!20, rounded corners=5pt, text centered, minimum height=2.5em, text width=7em, font=\ttfamily\small},
+        varbox/.style={rectangle, draw=red!80!black, thick, fill=yellow!20, text centered, minimum height=2em, text width=6em, font=\footnotesize\itshape},
+        myarrow/.style={->, >=Latex, thick},
+        configarrow/.style={->, >=Latex, thick, color=orange!80!black, dashed},
+        impactarrow/.style={->, >=Latex, very thick, color=red!80!black, dotted, rounded corners=5pt},
+    ]
+
+    %% --- Explicit Coordinate Placement ---
+    % User Space Nodes (Top Row)
+    \node[userbox] (app)   at (0, 0) {User-space Application};
+    \node[userbox] (admin) at (7, 0) {Admin Command\\ \texttt{sysctl -w ...}};
+
+    % Kernel Space - Entry Row
+    \node[kernelbox] (syscall) at (0, -3) {Syscall Interface};
+    \node[knobbox]   (knob)    at (7, -3) {\textbf{sysctl knob} (e.g., net.ipv4...)\vphantom{gy}};
+
+    % Kernel Space - Logic Row
+    \node[kernelbox, fill=red!15] (path_A) at (0, -5) {Execution Path Logic};
+    \node[kernelbox, fill=red!5, text width=5em] (path_B) at (3.5, -5) {Further Processing};
+    \node[varbox] (var) at (7, -5) {Internal Kernel Variable Value};
+    
+    % Subsystem Label
+    % \node[below=0.1cm of path_A, font=\footnotesize, text=red!80!black, align=center] (path_label) {\textbf{Target Subsystem}};
+
+    %% --- Background Layers & Boundaries ---
+    \begin{pgfonlayer}{background}
+        % User Space Background
+        \filldraw[blue!5, draw=blue!20, rounded corners] (-3.5, 1.5) rectangle (9.5, -1.2);
+        \node[anchor=north west, font=\sffamily\bfseries, color=blue!40!black] at (-3.5, 1.5) {User Space};
+
+        % Kernel Space Background
+        \filldraw[red!5, draw=red!20, rounded corners] (-3.5, -1.8) rectangle (9.5, -7.5);
+        \node[anchor=north west, font=\sffamily\bfseries, color=red!40!black] at (-3.5, -1.8) {Kernel Space};
+    \end{pgfonlayer}
+
+    % FIX: Boundary Line drawn cleanly
+    \draw[thick, dashed, gray] (-3.5, -1.5) -- (9.5, -1.5);
+    % FIX: Text explicitly centered at x=3.5 (exactly between the left and right flows)
+    \node[fill=white, font=\footnotesize\bfseries, text=gray!80!black, inner sep=3pt] at (3.5, -1.5) {User Space / Kernel Space Boundary};
+
+    %% --- Connections ---
+
+    % 1. Application Flow
+    \draw[myarrow] (app) -- node[left, font=\footnotesize, pos=0.15] {Invokes} (syscall);
+    \draw[myarrow] (syscall) -- (path_A);
+    \draw[myarrow] (path_A) -- (path_B);
+
+    % Return Loop
+    \draw[->, >=Latex, thick, gray!70] (path_B.north) -- ++(0, 0.1) -| node[pos=0.2, above, font=\footnotesize, text=gray!80!black] {Returns result} (app.south east);
+
+    % 2. Configuration Flow
+    \draw[configarrow] (admin) -- node[right, font=\footnotesize, pos=0.25] {Writes to} (knob);
+    \draw[configarrow] (knob) -- node[right, font=\footnotesize] {Modifies} (var);
+
+    % 3. Impact Flow
+    \draw[impactarrow] (var.south) -- ++(0, -1.2) -| (path_A.south)
+        node[pos=0.25, below, font=\footnotesize, color=red!80!black, align=center] {\textbf{Alters Logic} \\ (Impacts Performance)};
+
+    \end{tikzpicture}
+    \caption{Interaction between User-space applications, System Calls, and Kernel \textit{sysctl} configuration knobs. The diagram highlights how modifying an internal variable via \textit{sysctl} alters the actual execution path within a kernel subsystem.}
+    \label{fig:sysctl_architecture}
+\end{figure}
+
+The core idea driving this methodology is bipartite: first, we need to trace the top-down execution paths of syscalls originating from the application; second, we need to track the bottom-up propagation of \textit{sysctl} knobs to observe which kernel functions and data structures they influence.
+By intersecting these two distinct graphs, the syscall control-flow graph and the knob data-flow graph, we can isolate the precise points where a knob configuration directly alters an application execution path.
+This intersection provides a list of performance-critical knobs for a generic application workload.
+
+To illustrate this abstract intersection model, consider a concrete example within the Linux networking subsystem: the \texttt{listen()} system call and the \texttt{net.core.somaxconn} knob.
+As detailed in Algorithm~\ref{alg:somaxconn_intersect}, when a user-space application requests a specific backlog queue size for incoming TCP connections, the kernel does not blindly allocate the requested resources.
+Instead, the execution path transitions from the generic system call handler (\texttt{sys\_listen()}) into the protocol-specific logic (\texttt{inet\_listen()}), where it fetches the namespace-aware \textit{sysctl} value. Figure~\ref{fig:somaxconn_intersection} visually maps this control flow.
+The critical intersection occurs at the decision node: if the requested backlog exceeds the configured \texttt{somaxconn} limit, the kernel silently truncates the user-space request to enforce resource bounds.
+This silent truncation is a prime example of how \textit{sysctl} configurations dictate application-level behaviour and constrain performance without returning an explicit error code to the calling application.
+
+\begin{algorithm}[H]
+\caption{Intersection of \texttt{listen()} System Call and \texttt{net.core.somaxconn}}
+\label{alg:somaxconn_intersect}
+\begin{algorithmic}[1]
+
+\Require $fd$: File descriptor of the socket
+\Require $backlog$: Requested maximum queue length for pending connections
+\Ensure Sets socket to listening state with a kernel-bounded backlog queue
+
+\Statex
+\Function{sys\_listen}{$fd, backlog$} \Comment{System Call Entry Point}
+    \State $sock \gets \Call{sockfd\_lookup\_light}{fd, \dots}$
+    \If{$sock = \text{NULL}$}
+        \State \Return $\text{-EBADF}$
+    \EndIf
+    \Statex
+    \State $err \gets \Call{inet\_listen}{sock, backlog}$ \Comment{Drop into IPv4/TCP stack}
+    \State \Call{sockfd\_put}{$sock$}
+    \State \Return $err$
+\EndFunction
+
+\Statex
+\Function{inet\_listen}{$sock, backlog$} \Comment{Protocol-Specific Handler}
+    \State $sk \gets sock\rightarrow sk$
+    \State $net \gets \Call{sock\_net}{sk}$ \Comment{Retrieve the network namespace}
+    \Statex
+    \State \Comment{Fetch namespace-specific \textit{sysctl} knob}
+    \State $somaxconn \gets \text{READ\_ONCE}(net\rightarrow core.sysctl\_somaxconn)$
+    \Statex
+    \If{$backlog > somaxconn$} \Comment{The Intersection \& Cap}
+        \State $backlog \gets somaxconn$ \Comment{Silently truncate to kernel limit}
+    \EndIf
+    \Statex
+    \State $sk\rightarrow sk\_max\_ack\_backlog \gets backlog$ \Comment{Apply the bounded limit}
+    \State \Call{tcp\_set\_state}{$sk, \text{TCP\_LISTEN}$}
+    \State \Return $\text{SUCCESS}$
+\EndFunction
+
+\end{algorithmic}
+\end{algorithm}
+
+\begin{figure}[htbp]
+    \centering
+    \resizebox{0.85\textwidth}{!}{
+    \begin{tikzpicture}[
+        >=stealth,
+        node distance=1cm and 1.5cm,
+        % Styles
+        box/.style={rectangle, draw, rounded corners, minimum width=3.5cm, minimum height=1cm, align=center, font=\sffamily\small, fill=white},
+        decision/.style={diamond, draw, aspect=1.8, minimum width=3cm, minimum height=1cm, align=center, font=\sffamily\small, fill=yellow!10},
+        data/.style={cylinder, draw, shape border rotate=90, aspect=0.25, minimum height=1.5cm, minimum width=2.5cm, align=center, font=\sffamily\small, fill=orange!10},
+        group/.style={draw, dashed, inner sep=20pt, rounded corners}
+    ]
+
+    % --- Nodes ---
+    % User Space
+    \node[box, fill=blue!10] (app) {User Application \\ \texttt{listen(fd, 4096)}};
+
+    % Kernel Space - Syscall (INCREASED VERTICAL SPACING HERE)
+    \node[box, fill=green!10, below=2.5cm of app] (syscall) {\texttt{sys\_listen()} \\ System Call Entry};
+
+    % Kernel Space - Net Stack
+    \node[box, fill=green!10, below=of syscall] (inet) {\texttt{inet\_listen()} \\ TCP/IPv4 Handler};
+
+    % Sysctl / Namespace Data - Placed on the right
+    \node[data, right=2cm of inet] (sysctl) {Network Namespace \\ \texttt{sysctl\_somaxconn} \\ (e.g., 128)};
+
+    % Intersection
+    \node[decision, below=of inet] (check) {\texttt{backlog >} \\ \texttt{somaxconn}?};
+
+    % Truncation - Placed on the left
+    \node[box, fill=red!10, left=1.5cm of check] (truncate) {Truncate \\ \texttt{backlog = somaxconn}};
+
+    % Apply state
+    \node[box, fill=green!10, below=1.5cm of check] (apply) {Commit State \\ \texttt{sk\_max\_ack\_backlog} \\ $\gets$ \texttt{backlog}};
+
+    % --- Edges ---
+    \draw[->, thick] (app) -- (syscall) node[midway, right, font=\footnotesize] {User-Kernel Boundary};
+    \draw[->, thick] (syscall) -- (inet);
+    \draw[->, thick] (inet) -- (check) node[midway, right, font=\footnotesize] {Pass \texttt{backlog}};
+    
+    % Data flow edge
+    \draw[->, thick, dashed, draw=orange!80!black] (sysctl) |- (check) node[near end, above, font=\footnotesize, text=black] {\texttt{READ\_ONCE()}};
+    
+    % Control flow edges
+    \draw[->, thick] (check) -- (truncate) node[midway, above, font=\footnotesize] {Yes};
+    \draw[->, thick] (truncate) |- (apply);
+    \draw[->, thick] (check) -- (apply) node[midway, right, font=\footnotesize] {No};
+
+    % --- Backgrounds for Spaces ---
+    \begin{scope}[on background layer]
+        % User Space Background
+        \node[group, fill=blue!5, fit=(app)] (user_space) {};
+        % Label inside top-left
+        \node[anchor=north west, xshift=5pt, yshift=-5pt, font=\sffamily\bfseries\small, text=blue!80!black] at (user_space.north west) {User Space};
+
+        % Kernel Space Background
+        \node[group, fill=gray!5, fit=(syscall) (inet) (check) (truncate) (apply) (sysctl)] (kernel_space) {};
+        % Label inside top-left
+        \node[anchor=north west, xshift=5pt, yshift=-5pt, font=\sffamily\bfseries\small, text=gray!80!black] at (kernel_space.north west) {Kernel Space};
+    \end{scope}
+
+    \end{tikzpicture}
+    }
+    \caption{Control flow intersection demonstrating how the \texttt{net.core.somaxconn} \textit{sysctl} knob bounds the requested backlog queue from the \texttt{listen()} system call.}
+    \label{fig:somaxconn_intersection}
+\end{figure}
+
+\section{The Knob Analyser Framework}
+
+To track the influence of configuration parameters within the kernel, this research leverages an existing static analysis framework, hereafter referred to as the \textit{Knob Analyser}. The primary function of the Knob Analyser is to determine the complete sphere of influence a given \textit{sysctl} knob possesses within the kernel source code.
+
+When a \textit{sysctl} parameter is modified, it updates specific memory locations—often variables tied to the kernel internal state.
+The Knob Analyser performs a bottom-up analysis, beginning at the specific handler or variable bound to the \textit{sysctl} entry.
+It then iteratively tracks where this variable is read, utilized in conditional statements, or passed as an argument to other functions.
+By traversing the kernel source code in this manner, the framework constructs a comprehensive Call Graph (CG).
+In this graph, nodes represent kernel functions, and edges represent the propagation of the knob value between them.
+
+To illustrate this, Figure~\ref{fig:tcp_rmem_callgraph} presents a subset of the Call Graph generated for the \texttt{net.ipv4.tcp\_rmem} \textit{sysctl} knob.
+In this diagram, the nodes directly connected to \texttt{\_ROOT\_} represent the functions that directly use the knob value (or its propagation) in control-flow instructions.
+The incoming edges denote the specific kernel functions that eventually lead to the utilization of this root value.
+As demonstrated in the figure, the Knob Analyser successfully captures the parameter structural influence across three critical TCP operations: socket initialization (\texttt{tcp\_sk\_init}), the receive path via early \textit{demuxing} (\texttt{tcp\_v4\_early\_demux}), and the transmit path (through functions such as \texttt{\_\_tcp\_transmit\_skb} and \texttt{tcp\_write\_xmit}).
+By extracting these distinct call chains, the framework provides a clear, verifiable visualization of exactly which network subsystems are affected when the socket receive memory limits are tuned.
+
+\begin{figure}[htbp]
+    \centering
+    \resizebox{\textwidth}{!}{%
+        \begin{tikzpicture}[
+            node distance=1.5cm and 2cm,
+            % Styles for the nodes
+            func/.style={rectangle, draw=blue!70, fill=blue!5, thick, rounded corners, minimum width=3.5cm, minimum height=0.8cm, align=center, font=\ttfamily},
+            root/.style={rectangle, draw=red!70, fill=red!5, thick, rounded corners, minimum width=3.5cm, minimum height=0.8cm, align=center, font=\ttfamily\bfseries},
+            % Style for the edges
+            edge/.style={->, >=stealth, thick, draw=darkgray}
+        ]
+            % -------------------------
+            % 1. The ROOT Node
+            % -------------------------
+            \node[root] (root) {\_ROOT\_\\(tcp\_rmem)};
+            
+            % -------------------------
+            % 2. TCP Initialization Path
+            % -------------------------
+            \node[func] (tcp_sk_init) [right=1.5cm of root] {tcp\_sk\_init};
+            
+            % -------------------------
+            % 3. Early Demux Path (Rx)
+            % -------------------------
+            \node[func] (pskb_pull_tail) [above right=1.5cm and 0.5cm of root] {\_\_pskb\_pull\_tail};
+            \node[func] (tcp_early_demux) [above=1cm of pskb_pull_tail] {tcp\_v4\_early\_demux};
+            
+            % -------------------------
+            % 4. TCP Transmit Path (Tx)
+            % -------------------------
+            \node[func] (tcp_transmit_skb) [above left=1.5cm and 1cm of root] {\_\_tcp\_transmit\_skb};
+            \node[func] (tcp_send_ack) [left=1.5cm of tcp_transmit_skb] {\_\_tcp\_send\_ack};
+            \node[func] (tcp_send_probe) [above=0.8cm of tcp_send_ack] {tcp\_send\_window\_probe};
+            \node[func] (tcp_write_xmit) [above right=0.8cm and -1cm of tcp_send_probe] {tcp\_write\_xmit};
+            \node[func] (tcp_push_pending) [above=0.8cm of tcp_write_xmit] {\_\_tcp\_push\_pending\_frames};
+            
+            % -------------------------
+            % Edges (Call Chains)
+            % -------------------------
+            % Init path
+            \draw[edge] (tcp_sk_init) -- (root);
+            
+            % Demux path
+            \draw[edge] (pskb_pull_tail) -- (root);
+            \draw[edge] (tcp_early_demux) -- (pskb_pull_tail);
+            
+            % Transmit path
+            \draw[edge] (tcp_transmit_skb) -- (root);
+            \draw[edge] (tcp_send_ack) -- (tcp_transmit_skb);
+            \draw[edge] (tcp_send_probe) -- (tcp_transmit_skb);
+            \draw[edge] (tcp_write_xmit) -- (tcp_transmit_skb);
+            \draw[edge] (tcp_push_pending) -- (tcp_write_xmit);
+        \end{tikzpicture}
+    }
+    \caption{Call graph subset for the \texttt{net.ipv4.tcp\_rmem} \textit{sysctl} knob, illustrating the core TCP socket initialization, receive (early demux), and transmit paths.}
+    \label{fig:tcp_rmem_callgraph}
+\end{figure}
+
+\subsection{Framework Overview}
+
+The Knob Analyser is a static, inter-procedural analysis framework designed to trace the propagation of \textit{sysctl} configuration values through the Linux kernel.
+Its objective is to identify how a configuration parameter influences kernel behaviour by constructing a \textit{call graph} rooted at a given sysctl knob.
+In doing so, the framework provides a systematic mapping from the configuration interfaces to the kernel functions and code paths that they affect.
+
+The analysis operates on the kernel after it has been lowered to LLVM~\cite{llvm} Intermediate Representation (IR).
+This representation enables uniform handling of kernel constructs such as global variables, pointer arithmetic, structure accesses, and function calls, while abstracting away architecture-specific details.
+By working at the IR level, the Knob Analyser can reason about low-level kernel behaviour with sufficient precision to model complex interactions involving pointers, aliasing, and indirect calls.
+
+At a high level, the Knob Analyser treats each sysctl knob as an \textit{analysis source}.
+From this source, it tracks how the knob value propagates through the program via assignments, memory operations, function arguments, and return values.
+Whenever the value reaches an instruction that semantically uses it (such as a conditional check, a function call, or a write to a control structure), the corresponding function is recorded as part of the knob sphere of influence.
+
+\subsection{Analysis Entry Points}
+
+The framework supports both major \textit{sysctl} implementation patterns used in the kernel.
+In the first pattern, a sysctl knob is a constant variable and is associated with a custom \texttt{proc\_handler} function.
+In this case, the handler function is treated as the entry point of the analysis, and the knob value is propagated from the handler arguments into the function body.
+In the second pattern, the knob directly references a global variable that stores the configuration value.
+Here, the analysis begins at the global variable and tracks all uses (and propagation) of that variable throughout the kernel.
+
+This distinction is handled automatically by the Knob Analyser, allowing it to uniformly analyse \textit{sysctl} knobs regardless of their implementation style.
+In both cases, the framework establishes an initial analysis state and then recursively explores all reachable data and control dependencies.
+
+\subsection{Inter-procedural and Pointer Analysis}
+
+The Knob Analyser performs inter-procedural analysis to track configuration values across function boundaries.
+When a value is passed as an argument to a function, the analysis propagates the value into the callee formal parameters.
+Similarly, return values are tracked back to the caller, enabling complete end-to-end tracing across call chains.
+
+Pointer analysis is an integral component of the framework.
+The analyser accounts for pointer aliasing, pointer arithmetic, and indirect memory accesses, which are prevalent in kernel code.
+Special handling is implemented for \texttt{PHI} nodes to correctly model value merging at control-flow join points.
+Additionally, the framework resolves indirect function calls by tracking function pointer values, allowing it to incorporate dynamically dispatched calls into the call graph.
+
+\subsection{Call Graph Construction and Influence Detection}
+
+As the analysis progresses, the framework incrementally builds a call graph rooted at the \textit{sysctl} knob.
+A function is added to the call graph when the knob value reaches an instruction that dictates control-flow, indicating that the function behaviour may depend on the configuration parameter.
+To preserve analysis precision, the Knob Analyser maintains contextual information about the current call chain and execution path.
+This context-sensitive approach prevents spurious dependencies and allows multiple independent propagation paths to be analysed separately.
+
+\section{Extending Propagation: Data Flow Graph (DFG) Tracing}
+
+Although the original Knob Analyser focuses primarily on propagating configuration influence through function calls, this approach alone is insufficient for accurately capturing configuration dependencies in the Linux kernel.
+Kernel subsystems frequently rely on persistent global state, where configuration values are stored in global variables or embedded within complex, globally accessible data structures.
+As a result, the influence of a \textit{sysctl} knob may manifest far from its point of update and without a direct call-chain relationship.
+A representative example arises in the networking subsystem, where configuration values are written into global or namespace-specific structures and later read by unrelated execution paths.
+In such cases, a call graph analysis would fail to associate the reader functions with the originating configuration knob, despite their behaviour being directly influenced by its value.
+To address this limitation, this work extends the Knob Analyser with explicit \textit{data-flow graph (DFG) tracing}.
+This extension shifts the analysis paradigm from purely function-centric propagation to a state-based propagation model that explicitly tracks how configuration values flow through global memory.
+
+% \subsection{Global State as a Propagation Medium}
+
+The DFG extension treats global variables and global memory locations as propagation nodes.
+When a sysctl handler writes a configuration value to a global variable, the analysis records this event as a data-flow edge originating from the sysctl knob.
+The global variable then acts as a persistent storage node through which the configuration state can influence arbitrary parts of the kernel.
+Subsequent reads from the same global variable (whether occurring in the same function, a different function, or an entirely different subsystem) are linked back to the original write through the data-flow graph.
+This allows the analyser to capture dependencies that are not expressed through direct function invocation but instead arise from shared state.
+
+\subsection{DFG Construction and Propagation Rules}
+
+The data-flow graph is constructed incrementally during the analysis.
+Nodes in the graph correspond to LLVM IR values, instructions, and global variables, while edges represent concrete data-flow relationships such as assignments, loads, stores, and argument passing.
+Each edge is annotated with the type of propagation event (e.g., global write, global read, pointer dereference), enabling precise interpretation of the dependency.
+
+When a sysctl knob updates a global variable, the analyser records a data-flow edge from the knob source to the global variable.
+The framework then monitors all uses of that global variable, including:
+\begin{itemize}
+    \item Direct loads and stores,
+    \item Structure field accesses via pointer arithmetic,
+    \item Propagation through constant expressions and initializers,
+    \item Indirect propagation through pointer aliasing.
+\end{itemize}
+
+For each such use, a corresponding data-flow edge is added, and the analysis continues from the consuming instruction or function.
+This ensures that the influence of the configuration value is tracked even when it re-enters the execution flow at a later point in time.
+
+\subsection{Integration with the Knob Analyser Framework}
+
+The DFG tracing mechanism is integrated directly into the existing Knob Analyser workflow.
+Data-flow edges are recorded alongside control-flow and call-graph information using a unified path state representation. This integration allows the analyser to correlate state-based dependencies with their corresponding execution contexts, preserving the provenance of each propagation path.
+By extending the original framework in this manner, the resulting analysis produces not only a call graph but a richer dependency graph that captures both functional and state-based influences of sysctl configuration parameters.
+
+\section{The Syscall Analyser Framework}
+
+To map the execution paths of generic applications within the kernel, this thesis introduces the \textbf{Syscall Analyser}, a custom-built static analysis framework.
+Its primary objective is to generate precise, top-down call graphs for specific system calls.
+To prove the efficacy of this methodology, implementation efforts were specifically focused on the kernel networking subsystem—a highly complex, performance-critical area where \texttt{sysctl} tuning is frequent and impactful.
+
+\subsection{Static Analysis in the Linux Kernel}
+
+Analysing a codebase as vast and dynamic as the Linux kernel requires robust static analysis techniques.
+The kernel heavily utilizes object-oriented design patterns implemented in C to maintain modularity.
+This is achieved by relying extensively on structures populated with function pointers (e.g., \texttt{struct file\_operations}, \texttt{struct proto\_ops}).
+Although this provides excellent abstraction, it creates a significant challenge for static analysis tools: resolving indirect function calls.
+When the analyser encounters an invocation via a function pointer, it must determine which actual function is being executed at runtime to construct an accurate call graph.
+
+\subsection{Challenges of Indirect Function Calls}
+
+Resolving indirect calls is famously difficult in static analysis.
+Two primary theoretical approaches exist to tackle this problem, each with significant trade-offs regarding precision and scalability:
+
+\begin{itemize}
+    \item \textbf{Pointer Analysis (Alias Analysis):} this technique attempts to determine exactly which memory locations a pointer can point to at any given point during execution. It tracks the flow of variables and assignments throughout the program. A context-sensitive, flow-sensitive pointer analysis provides highly precise results, as it accurately maps the exact functions assigned to a pointer. However, this method is computationally prohibitive. Tracking every possible memory state across the millions of lines of code present in the Linux kernel results in state explosion, making full pointer analysis unscalable for global kernel analysis.
+    
+    \item \textbf{Type Analysis:} as a lightweight alternative, type analysis resolves indirect calls simply by matching the type signature of the function pointer (return type and argument types) with the signatures of available functions in the codebase. While highly scalable and fast, basic type analysis suffers severely from over-approximation. Because many kernel functions share identical signatures, basic type analysis connects an indirect call to dozens of incompatible functions, leading to the inclusion of unreachable paths (false positives) and a heavily bloated generated call graph.
+\end{itemize}
+
+To balance the scalability of type analysis with the precision required for kernel-level call graphs, this methodology utilizes \textbf{Strong Multilayer Type Analysis (SMLTA)}.
+SMLTA mitigates the over-approximation of standard type analysis by restricting matches based on structural context~\cite{smlta}.
+Instead of only looking at the function signature, SMLTA evaluates the specific \texttt{struct} type that contains the function pointer, and the nested layers of type definitions.
+By mapping which functions are actually assigned to specific structure fields during subsystem initialization, SMLTA accurately resolves function pointers within the kernel complex data structures without the prohibitive overhead of full pointer analysis.
+
+\subsection{Implementation of the Syscall Analyser}
+
+The theoretical foundation provided by SMLTA allows the Syscall Analyser to effectively traverse the kernel codebase.
+The implementation of the analyser relies on two core mechanisms: accurate indirect call resolution and aggressive, context-sensitive graph pruning.
+
+\subsubsection{Resolving Indirect Calls}
+
+The Syscall Analyser leverages SMLTA as its core engine to resolve indirect calls.
+In the networking subsystem, a generic system call often interfaces with protocol-specific code via function pointers.
+For instance, when an application invokes a socket operation, the generic kernel code might execute an indirect call such as \texttt{sock->ops->sendmsg}.
+A naive analyser would halt here or over-approximate.
+SMLTA examines the layered type hierarchy, filtering potential targets to only those functions explicitly assigned to the relevant structural fields.
+However, even with SMLTA providing precise indirect call resolution, a top-down trace of a syscall yields a massive graph containing parallel branches for TCP, UDP, raw sockets, and various other protocols.
+Because applications typically use a specific subset of these protocols, a generalized graph is not helpful for targeted performance tuning.
+
+To generate minimal call graphs, the Syscall Analyser implements a context-sensitive pruning strategy based on a two-phase refinement algorithm: \textbf{Target Classification} and \textbf{Priority Filtering}, as outlined in Algorithm \ref{alg:general_refinement}.
+Instead of relying on dynamic workload profiling, the framework operates in a workload-agnostic manner by accepting explicit configuration parameters as input.
+By specifying the target socket domain (e.g., \texttt{AF\_INET}) and type (e.g., \texttt{SOCK\_STREAM} - TCP protocol), a definitive execution context is established to guide the static pruning process.
+
+During the \textbf{Classification Phase} (Algorithm \ref{alg:general_refinement}, lines 4-13), for every indirect call-site, the analyser categorizes the raw targets provided by SMLTA into distinct architectural layers: the Virtual File System (VFS) layer, the Protocol layer, the Network layer, and a generic allowed Subsystem layer.
+Functions that violate the execution context (e.g., UDP functions in a TCP context) or belong to irrelevant subsystems are immediately discarded.
+
+During the \textbf{Priority Filtering Phase} (Algorithm \ref{alg:general_refinement}, line 15), the analyser applies a strict hierarchy to resolve ambiguity.
+If valid targets exist in a higher-level abstraction (like the VFS layer), the analyser assumes this call-site is a high-level dispatch and discards lower-priority targets to prevent graph explosion.
+
+\begin{algorithm}[ht]
+\caption{General Context-Sensitive Refinement Algorithm}
+\label{alg:general_refinement}
+\begin{algorithmic}[1]
+\Require $Callsite\ C$, $Targets\ T_{SMLTA}$, $Context\ ctx$
+\Ensure $RefinedTargets\ T_{refined}$
+\State $Buckets \gets \{VFS: \emptyset, Proto: \emptyset, Net: \emptyset, Subsys: \emptyset\}$
+\ForAll{$func \in T_{SMLTA}$}
+    \If{\Call{ShouldSkip}{$func, ctx$}}
+        \State \textbf{continue} \Comment{Prune mismatches and error paths}
+    \EndIf
+    \If{\Call{IsBoundTo}{$func, VFS\_Ops$}}
+        \State $Buckets.VFS \gets Buckets.VFS \cup \{func\}$
+    \ElsIf{\Call{IsBoundTo}{$func, ctx.Protocol$}}
+        \State $Buckets.Proto \gets Buckets.Proto \cup \{func\}$
+    \ElsIf{\Call{IsBoundTo}{$func, Network\_Ops$}}
+        \State $Buckets.Net \gets Buckets.Net \cup \{func\}$
+    \ElsIf{\Call{IsInWhitelist}{$func$}}
+        \State $Buckets.Subsys \gets Buckets.Subsys \cup \{func\}$
+    \EndIf
+\EndFor
+\State \Return \Call{ApplyPrioritySelection}{$Buckets$}
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Case Study: Refining the \texttt{sys\_write} Path}
+
+To illustrate this methodology in practice, we examine the refinement of the \texttt{sys\_write} system call path within a networking context.
+When a user-space application writes data to a socket file descriptor, the operation traverses several highly abstracted layers of the kernel: the Virtual File System (VFS), the generic socket layer, the transport protocol, and the network protocol. 
+In the Linux kernel, a standard \texttt{write()} system call flows as follows:
+\begin{enumerate}
+    \item \textbf{VFS Dispatch:} the entry point \texttt{ksys\_write()} calls \texttt{vfs\_write()}, which invokes the file-specific write operations via an indirect call: \texttt{file->f\_op->write\_iter()}. For sockets, this function pointer resolves to \texttt{sock\_write\_iter()}.
+    \item \textbf{Socket Dispatch:} the iteration helper calls \texttt{sock\_sendmsg()}, which triggers another indirect call to the address family-specific routing function: \texttt{sock->ops->sendmsg()}. For IPv4, this resolves to \texttt{inet\_sendmsg()}.
+    \item \textbf{Protocol Dispatch:} finally, \texttt{inet\_sendmsg()} routes the data to the specific transport protocol via a third indirect call: \texttt{sk->sk\_prot->sendmsg()}. Depending on the socket type, this resolves to \texttt{tcp\_sendmsg} or \texttt{udp\_sendmsg}.
+\end{enumerate}
+
+Without context-sensitive pruning, a static analysis tool evaluates every indirect call as a massive multiplexer, linking \texttt{vfs\_write()} to every file system in the kernel, and \texttt{inet\_sendmsg()} to every transport protocol.
+The \texttt{WriteRefiner} systematically collapses this complexity to generate a deterministic, protocol-specific path (visualized in Figure \ref{fig:sys_write_refinement}). 
+The refinement process begins by loading the established context (e.g., \texttt{AF\_INET} and \texttt{SOCK\_STREAM} for TCP) and locating key global operation structures within the LLVM IR.
+Specifically, the framework identifies \texttt{socket\_file\_ops} and \texttt{ipv4\_specific}, which serve as anchor points to identify architectural boundaries.
+
+\begin{figure}[ht]
+    \centering
+    % Define TikZ styles
+    \tikzset{
+        box/.style={draw, rectangle, rounded corners, minimum width=3cm, minimum height=0.8cm, align=center, font=\small},
+        actionbox/.style={draw, rectangle, fill=gray!10, minimum width=3.5cm, minimum height=0.8cm, align=center, font=\small},
+        arrow/.style={->, >=stealth, thick},
+        dashedarrow/.style={->, >=stealth, thick, dashed}
+    }
+    
+    \begin{minipage}[t]{0.48\textwidth}
+        \centering
+        \textbf{Kernel Implementation Flow} \\ \vspace{0.3cm}
+        \begin{tikzpicture}[node distance=0.8cm]
+            \node (sys) [box, fill=blue!10] {\texttt{sys\_write()} \\ (User Space Entry)};
+            \node (vfs) [box, fill=green!10, below=of sys] {\texttt{vfs\_write()} \\ (VFS Layer)};
+            \node (sock) [box, fill=orange!10, below=of vfs] {\texttt{sock\_sendmsg()} \\ (Socket Layer)};
+            \node (inet) [box, fill=orange!10, below=of sock] {\texttt{inet\_sendmsg()} \\ (IPv4 Routing)};
+            
+            \node (tcp) [box, fill=red!10, below left=0.6cm and -1cm of inet] {\texttt{tcp\_sendmsg()}};
+            \node (udp) [box, fill=red!10, below right=0.6cm and -1cm of inet] {\texttt{udp\_sendmsg()}};
+
+            \draw [arrow] (sys) -- (vfs);
+            \draw [arrow] (vfs) -- node[right, font=\scriptsize] {\texttt{->write\_iter()}} (sock);
+            \draw [arrow] (sock) -- node[right, font=\scriptsize] {\texttt{->sendmsg()}} (inet);
+            \draw [dashedarrow] (inet) -- node[left, font=\scriptsize] {TCP} (tcp);
+            \draw [dashedarrow] (inet) -- node[right, font=\scriptsize] {UDP} (udp);
+        \end{tikzpicture}
+    \end{minipage}%
+    \hfill
+    \begin{minipage}[t]{0.48\textwidth}
+        \centering
+        \textbf{Refiner Pipeline Logic} \\ \vspace{0.3cm}
+        \begin{tikzpicture}[node distance=0.8cm]
+            \node (start) [box, fill=purple!10] {Raw SMLTA Targets};
+            \node (vfs) [actionbox, below=of start] {\textbf{1. VFS Boundary}\\Identify \texttt{sock\_write\_iter}\\Prune other file systems};
+            \node (inject) [actionbox, below=of vfs] {\textbf{2. Edge Injection}\\Insert TCP/UDP\\at \texttt{inet\_sendmsg}};
+            \node (context) [actionbox, below=of inject] {\textbf{3. Enforce Context}\\Match \texttt{SOCK\_STREAM}\\Prune \texttt{udp\_sendmsg}};
+            \node (end) [box, fill=blue!10, below=of context] {Refined TCP Graph};
+
+            \draw [arrow] (start) -- (vfs);
+            \draw [arrow] (vfs) -- (inject);
+            \draw [arrow] (inject) -- (context);
+            \draw [arrow] (context) -- (end);
+        \end{tikzpicture}
+    \end{minipage}
+    \caption{Comparison of the \texttt{sys\_write} kernel implementation execution flow (left) and the Syscall Analyser static graph refinement pipeline (right).}
+    \label{fig:sys_write_refinement}
+\end{figure}
+
+Once initialized, the framework resolves the graph top-down by applying its classification and filtering heuristics to each call-site (as demonstrated in the right panel of Figure \ref{fig:sys_write_refinement}):
+
+\paragraph{1. Refining the VFS Boundary.}
+Consider the first indirect call originating from the generic \texttt{vfs\_write()}.
+SMLTA might identify dozens of potential targets (e.g., generic file writes, pipe writes, socket writes).
+The classification phase cross-references these targets against the initializer of \texttt{socket\_file\_ops}.
+Because \texttt{sock\_write\_iter} is explicitly bound to this structure, it is placed in the VFS bucket.
+Then, the framework selects the VFS bucket and forcefully prunes all non-socket filesystem targets from the graph.
+
+\paragraph{2. Bridging the Protocol Gap.}
+The refinement of \texttt{sys\_write} highlights a crucial fallback feature of the Syscall Analyser: \textbf{Edge Injection}.
+Static pointer analysis (like SMLTA) can occasionally fail to resolve structurally complex indirect calls heavily reliant on deep field sensitivity, such as the invocation of \texttt{sk->sk\_prot->sendmsg} within \texttt{inet\_sendmsg}.
+If the base analysis yields an empty target set for this critical dispatch, the \texttt{WriteRefiner} proactively injects the valid protocol-specific targets (e.g., \texttt{tcp\_sendmsg} and \texttt{udp\_sendmsg}) to ensure the Control Flow Graph remains contiguous.
+
+\paragraph{3. Enforcing the Execution Context.}
+Once the protocol targets are identified at the \texttt{inet\_sendmsg} call-site, the framework enforces the user-defined context.
+The framework evaluates the targets against the \texttt{SOCK\_STREAM} specification.
+It detects a protocol mismatch for \texttt{udp\_sendmsg} and prunes it entirely. 
+
+The result of this systematic classification, injection, and pruning is a highly refined directed graph.
+To quantify this optimization, the initial raw graph of 6,190 nodes and 37,109 edges was condensed to only 228 nodes and 394 edges, resulting in a reduction of \textbf{96.3\%} nodes and \textbf{98.9\%} edges.
+Instead of an over-approximated graph of kernel subsystems, the output represents the singular, deterministic execution path from the system call entry point down to its actual implementation.
+This resulting graph, stripped of branching noise and irrelevant generic logic, is visualized in Figure \ref{fig:sys_write_subgraph}, which highlights the main data plane sequence traversing \texttt{vfs\_write}, \texttt{inet\_sendmsg}, and \texttt{tcp\_sendmsg\_locked}.
+
+\begin{figure}[ht]
+    \centering
+    \resizebox{0.85\textwidth}{!}{
+    \begin{tikzpicture}[
+        node distance=0.6cm and 0.5cm,
+        % Core styles
+        box/.style={draw, rectangle, rounded corners, fill=blue!5, font=\ttfamily\small, align=center, inner sep=5pt, minimum height=0.6cm, minimum width=4cm},
+        sidebox/.style={draw, rectangle, rounded corners, fill=gray!10, font=\ttfamily\scriptsize, align=center, inner sep=4pt, minimum height=0.5cm, minimum width=3.4cm},
+        ipbox/.style={draw, rectangle, rounded corners, dashed, thick, fill=green!5, font=\sffamily\small, align=center, inner sep=5pt, minimum height=0.8cm, minimum width=4.5cm},
+        arrow/.style={->, >=stealth, thick, color=black},
+        % Dashed arrows for side branches
+        dashedarrow/.style={->, >=stealth, thick, dashed, color=darkgray}
+    ]
+    
+    % --- Main Backbone (Top-Down) ---
+    \node (x64) [box] {\_\_x64\_sys\_write};
+    \node (ksys) [box, below=of x64] {ksys\_write};
+    \node (vfs) [box, below=of ksys] {vfs\_write};
+    \node (sock) [box, below=of vfs] {sock\_write\_iter};
+    \node (inet) [box, below=of sock] {inet\_sendmsg};
+    \node (tcp) [box, below=of inet] {tcp\_sendmsg};
+    \node (tcplock) [box, below=of tcp] {tcp\_sendmsg\_locked};
+    
+    % --- TCP Layer Fan-Out ---
+    % Center: Main data path continuing downwards
+    % Pushed further down (2.5cm) to give room for the side nodes
+    \node (push) [box, fill=red!10, below=2.5cm of tcplock] {tcp\_push};
+    
+    % Left side column: Memory and SKB management
+    % Positioned relative to 'push' but branching from 'tcplock'
+    \node (alloc) [sidebox, left=1.2cm of push] {tcp\_stream\_alloc\_skb};
+    \node (wmem) [sidebox, above=0.3cm of alloc] {sk\_wmem\_schedule};
+    \node (entail) [sidebox, below=0.3cm of alloc] {tcp\_skb\_entail};
+    
+    % Right side column: Features and Cleanup
+    \node (fastopen) [sidebox, right=1.2cm of push] {tcp\_sendmsg\_fastopen};
+    \node (zcopy) [sidebox, above=0.3cm of fastopen] {tcp\_downgrade\_zcopy\_pure};
+    \node (removeskb) [sidebox, below=0.3cm of fastopen] {tcp\_remove\_empty\_skb};
+    
+    % --- IP Layer Continuation ---
+    \node (ip) [ipbox, below=1cm of push] {Continues to IP Layer \\ (\texttt{ip\_queue\_xmit}, etc.)};
+    
+    % --- Edges ---
+    % Backbone Connections
+    \draw [arrow] (x64) -- (ksys);
+    \draw [arrow] (ksys) -- (vfs);
+    \draw [arrow] (vfs) -- (sock);
+    \draw [arrow] (sock) -- (inet);
+    \draw [arrow] (inet) -- (tcp);
+    \draw [arrow] (tcp) -- (tcplock);
+    \draw [arrow] (tcplock) -- (push);
+    
+    % TCP Auxiliary Connections (Curved Routing to avoid all overlapping)
+    % out=180 means the line leaves the left side heading left.
+    % in=0 means the line enters the right side heading left.
+    \draw [dashedarrow] (tcplock.west) to[out=180, in=0] (wmem.east);
+    \draw [dashedarrow] (tcplock.west) to[out=180, in=0] (alloc.east);
+    \draw [dashedarrow] (tcplock.west) to[out=180, in=0] (entail.east);
+    
+    % out=0 means leaving right heading right. 
+    % in=180 means entering left heading right.
+    \draw [dashedarrow] (tcplock.east) to[out=0, in=180] (zcopy.west);
+    \draw [dashedarrow] (tcplock.east) to[out=0, in=180] (fastopen.west);
+    \draw [dashedarrow] (tcplock.east) to[out=0, in=180] (removeskb.west);
+    
+    % Transition to IP Layer
+    \draw [arrow, dashed, ultra thick] (push) -- (ip);
+    
+    \end{tikzpicture}
+    }
+    \caption{A refined topological sub-graph of \texttt{sys\_write} focused exclusively on the TCP layer. Curved routing explicitly maps the auxiliary execution fan-out at \texttt{tcp\_sendmsg\_locked} while tracing the primary data sequence down into the IP layer.}
+    \label{fig:sys_write_subgraph}
+\end{figure}
+
+\section{Graph Intersection for Critical Knob Identification}
+
+With the bottom-up knob propagation graphs and the top-down syscall execution graphs generated, the final methodological step is their intersection.
+
+Let the directed graph generated by the Knob Analyser for a specific configuration parameter $k$ be denoted as \(G_k = (V_k,E_k)\).
+Here, \(V_k\) represents the set of kernel functions influenced by knob $k$.
+To determine whether knob $k$ is critical to an application utilizing a specific set of system calls, we perform an intersection of the vertex sets.
+The set of critical knobs $\mathcal{K}'$ for a given syscall graph $G_s$ is identified as:
+
+\[\mathcal{K}' = \{k \in \mathcal{K} | V_k \cap V_s \neq \varnothing \}\]
+
+If the intersection of the functions influenced by the knob ($V_k$) and the functions executed by the syscall ($V_s$) is non-empty, it proves that the execution path of the application crosses a memory space or conditional branch controlled by that specific sysctl parameter.
+This mathematical intersection provides a highly precise and automated mechanism for filtering thousands of kernel parameters down to a targeted list of \textbf{performance-critical} knobs.
+
+Building upon the fundamental boolean intersection, our methodology introduces a topological scoring mechanism to quantify the potential impact and functional scope of each critical knob.
+Because kernel execution paths are highly hierarchical, the relative distance of an affected function from the system call entry point provides crucial heuristic value for performance tuning.
+
+\subsection{Topological Depth Mapping}
+
+For a given system call graph $G_s = (V_s,E_s)$, let the entry point of the system call (e.g., sys\_write) be defined as the root node $r_s \in V_s$.
+We define a depth mapping function $\delta_s(v)$ that assigns a discrete distance score to every function $v \in V_s$ based on the unweighted shortest path length from $r_s$:
+
+\[\delta_s(v) = d(r_s, v) \quad \forall v \in V_s\]
+
+where $d(r_s,v)$ denotes the minimum number of edges required to traverse from $r_s$ to $v$.
+This depth is computed for all system call graphs via Breadth-First Search (BFS) during the initialization phase.
+
+\subsection{Intersection and Impact Scoring}
+
+For each candidate knob $k$ and system call $s$, we define the set of active intersection functions as \(V_{int}^{s,k} = (V_k \cap V_s) \setminus \{r_s\}\).
+If \(V_{int}^{s,k} \neq \emptyset\), we calculate two heuristic scores to characterize the knob behavioural impact.
+
+\paragraph{1. High-Impact Proximity Score (Minimum Depth).}
+The minimum depth represents the shallowest point in the kernel execution stack where the sysctl parameter has influence.
+
+\[\Delta_{min}(k,s) = \min_{v \in V_{int}^{s,k}} \delta_s(v)\]
+
+\textbf{Heuristic Rationale}: a shorter distance (lower $\Delta_{min}$) suggests that the knob intercepts the execution path early.
+These parameters often dictate high-level control flows, early-exit conditions (fast paths), or broad resource allocations, resulting in a potentially higher and more immediate impact on application performance.
+
+\paragraph{2. Functional Complexity Score (Maximum Depth).}
+In contrast, the maximum depth represents the deepest reach of the parameter in the kernel hierarchy.
+
+\[\Delta_{max}(k,s) = \max_{v \in V_{int}^{s,k}} \delta_s(v)\]
+
+Heuristic Rationale: a higher distance (larger $\Delta_{max}$) indicates the parameter reaches deep into driver-level logic, hardware state machines, or highly specific protocol behaviours (e.g., low-level TCP congestion control adjustments).
+
+\subsection{Algorithmic Execution and Ranking}
+
+Modern applications rarely rely on a single system call.
+Let $\mathcal{S}$ denote the target set of active system calls under analysis (e.g., $\mathcal{S}$ = {\texttt{sys\_write}, \texttt{sys\_read}, \texttt{sys\_epoll\_wait}}).
+To determine the global tuning priority of a configuration parameter $k$ across the entire workload, we aggregate the scores across all $s \in \mathcal{S}$:
+
+\[Global\_Min(k) = \min_{\{s \in \mathcal{S} \mid V_{int}^{s,k} \neq \emptyset\}} \Delta_{min}(k,s)\]
+
+\[Global\_Max(k) = \max_{\{s \in \mathcal{S} \mid V_{int}^{s,k} \neq \emptyset\}} \Delta_{max}(k,s)\]
+
+The complete logic for isolating and ranking the tunable parameters operates as follows:
+\begin{enumerate}
+    \item \textbf{Graph Ingestion}: parse the graph files representing $\mathcal{S}$ and $\mathcal{K}$, computing the topological depth mapping $\delta_s(v)$ for all $s \in \mathcal{S}$.
+    \item \textbf{Intersection Computation}: iteratively calculate $V_{int}^{s,k}$ for all pairs of knobs and system calls.
+    \item \textbf{Scoring}: compute $\Delta_{min}$ and $\Delta_{max}$ for every valid intersection.
+    \item \textbf{Aggregation and Ranking}: aggregate the localized scores into $Global\_Min$ and $Global\_Max$. The final output bifurcates the critical set $\mathcal{K}'$ into two priority queues:
+    \begin{itemize}
+        \item A list sorted in \textbf{ascending order} of $Global\_Min$, prioritizing knobs that alter high-level execution fast-paths.
+        \item A list sorted in \textbf{descending order} of $Global\_Max$, prioritizing knobs that orchestrate complex, deep-stack kernel mechanics.
+    \end{itemize}
+\end{enumerate}
+
+By structuring the intersection logically and topologically, this framework distils thousands of undocumented kernel variables into a minimal and actionable search space.
+
+\section{Overall System Architecture}
+\label{sec:system_architecture}
+
+The complete architecture of the proposed system is designed as an automated, multi-stage static analysis pipeline.
+The end-to-end execution flow is visualized in Figure~\ref{fig:overall_architecture} and is composed of four primary stages:
+\begin{enumerate}
+    \item Input Stage: the system takes the Linux Kernel source code in bit-code format.
+    \item Parallel Analysis Stage: the Knob Analyser scans the kernel source, mapping the propagation of all sysctl parameters to generate the set of graphs $G_k$. Simultaneously, the Syscall Analyser uses SMLTA and the workload profile to map the top-down execution paths, applying the pruning strategy to generate the context-specific syscall graph $G_s$.
+    \item Intersection Engine: the outputs of both analysers are fed into the Intersection Engine, which computes the overlaps between the control flow and data flow graphs.
+    \item Output Stage: the system outputs a definitive, list of critical \textit{sysctl} knobs that reside on the application execution path, ready for performance tuning.
+\end{enumerate}
+
+\begin{figure}[htbp]
+    \centering
+    \resizebox{0.75\textwidth}{!}{
+    \begin{tikzpicture}[
+        node distance=0.8cm and 0.8cm,
+        % Styles
+        inputbox/.style={draw, rectangle, rounded corners, fill=gray!10, minimum width=2.8cm, minimum height=0.8cm, align=center, font=\footnotesize\sffamily},
+        enginebox/.style={draw, rectangle, rounded corners, fill=blue!10, minimum width=4cm, minimum height=1cm, align=center, font=\textbf\footnotesize\sffamily, thick},
+        databox/.style={draw, cylinder, shape border rotate=90, aspect=0.25, fill=yellow!10, minimum height=1cm, minimum width=1.8cm, align=center, font=\scriptsize\ttfamily},
+        logicbox/.style={draw, diamond, aspect=1.8, fill=purple!10, minimum width=3cm, minimum height=1.2cm, align=center, font=\footnotesize\sffamily},
+        outputbox/.style={draw, rectangle, rounded corners, fill=green!10, minimum width=3.8cm, minimum height=0.8cm, align=center, font=\footnotesize\sffamily, thick},
+        arrow/.style={->, >=stealth, thick},
+        groupbox/.style={draw, rectangle, dashed, rounded corners, inner sep=10pt, fill=black!2}
+    ]
+
+    % --- Stage 1: Inputs ---
+    \node (llvm) [inputbox] {Linux Kernel\\LLVM IR Bitcode};
+    % Increased right distance to 2.5cm to pull the blue boxes apart
+    \node (profile) [inputbox, right=2.5cm of llvm] {Workload Profile\\(Syscall Context)};
+
+    % --- Stage 2: Parallel Analysis ---
+    \node (knob_engine) [enginebox, below=1cm of llvm] {Knob Analyser\\(Bottom-Up Data Flow)};
+    \node (sys_engine) [enginebox, below=1cm of profile] {Syscall Analyser\\(Top-Down Control Flow)};
+    
+    % Group box for Stage 2
+    \begin{pgfonlayer}{background}
+        \node [groupbox, fit=(knob_engine) (sys_engine), label=left:\rotatebox{90}{\textbf{\footnotesize Parallel Analysis}}] {};
+    \end{pgfonlayer}
+
+    % --- Intermediate Data ---
+    \node (gk) [databox, below=0.8cm of knob_engine] {Knob Graphs\\$G_k = (V_k, E_k)$};
+    \node (gs) [databox, below=0.8cm of sys_engine] {Syscall Graphs\\$G_s = (V_s, E_s)$};
+
+    % --- Stage 3: Intersection Engine ---
+    % Adjusted xshift to perfectly center between the newly widened columns
+    \node (intersect) [logicbox, below=1cm of gk, xshift=2.65cm] {Intersection \& \\ Scoring Engine \\ $V_k \cap V_s$};
+
+    % --- Stage 4: Outputs ---
+    % Increased the vertical drop (from 0.8cm to 1.5cm) to move them more down
+    \node (out_min) [outputbox, below left=1.5cm and 0.2cm of intersect] {Ordered Critical Knobs\\(by $\Delta_{min}$ Ascending)};
+    \node (out_max) [outputbox, below right=1.5cm and 0.2cm of intersect] {Ordered Critical Knobs\\(by $\Delta_{max}$ Descending)};
+
+    % --- Connections ---
+    % Inputs to Engines
+    \draw [arrow] (llvm) -- (knob_engine);
+    \draw [arrow] (llvm) -- (sys_engine);
+    \draw [arrow] (profile) -- (sys_engine);
+
+    % Engines to Data
+    \draw [arrow] (knob_engine) -- (gk);
+    \draw [arrow] (sys_engine) -- (gs);
+
+    % Data to Intersection
+    \draw [arrow] (gk) -- (intersect.north west);
+    \draw [arrow] (gs) -- (intersect.north east);
+
+    % Intersection to Outputs
+    \draw [arrow] (intersect.south) -- (out_min.north);
+    \draw [arrow] (intersect.south) -- (out_max.north);
+
+    \end{tikzpicture}
+    }
+    \caption{The end-to-end static analysis pipeline. The framework ingests kernel bitcode and workload profiles, parallelizes the bottom-up knob mapping and top-down syscall tracing, and strictly computes their topological intersection to produce a minimal set of tuning parameters.}
+    \label{fig:overall_architecture}
+\end{figure}
+
+\newpage

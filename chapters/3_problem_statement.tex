@@ -1,0 +1,328 @@
+\chapter{Problem Statement}\label{ch:problem}
+
+This chapter translates the motivations from Chapter~\ref{ch:introduction} and the literature survey from Chapter~\ref{ch:background} into a precise research problem.
+While automated performance tuning has achieved significant maturity in the domain of specific applications, most notably Database Management Systems (DBMS)~\cite{qtune,ottertune} and big data frameworks, these approaches typically treat the underlying Operating System (OS) as a static black box. They focus on optimizing application-level parameters (e.g., buffer pool sizes, query caches) while neglecting the kernel configuration upon which the application relies.
+This thesis addresses this gap by targeting the \emph{search-space} bottleneck in automated performance tuning of the Linux kernel itself. Unlike application-specific tuners, the approach focuses on the generic system call interfaces and kernel subsystems, making the solution applicable across diverse workloads.
+
+\section{Problem Context}\label{sec:problem-context}
+
+Modern services commonly run inside single-tenant virtual machines or containers, yet they inherit a general-purpose Linux kernel configuration.
+Linux exposes thousands of runtime parameters (e.g., via \texttt{sysctl}) that control major subsystems such as networking, memory management, and I/O~\cite{kernel_parameters}.
+These parameters are organized hierarchically, as illustrated in Figure \ref{fig:sysctl_tree}.
+
+\begin{figure}[ht]
+    \centering
+    \tikzset{
+      myfolder/.style={fill=blue!10, draw=blue!50, thick, rounded corners},
+      myfile/.style={fill=white, draw=gray!50, rounded corners, font=\sffamily\small}
+    }
+
+    \begin{forest}
+      for tree={
+        font=\sffamily\bfseries,
+        if n children=0{myfile}{myfolder},
+        edge={draw=darkgray, thick}
+      }
+      [/proc/sys, 
+        grow=270,               % 1. Make the root grow downwards
+        parent anchor=south,
+        l sep=8mm,              % Vertical drop before the columns start
+        s sep=2mm,              % Horizontal space between the 4 main columns
+        for children={
+          for tree={
+            folder,             % 2. Make all sub-levels use the vertical folder style
+            grow'=0,            % Folder children grow to the right
+            fit=band,
+            s sep=4pt           % Vertical space between files
+          },
+          % 3. Override the edge path for the 4 main columns so they connect neatly
+          child anchor=north,
+          edge path={
+            \noexpand\path[\forestoption{edge}]
+              (!u.parent anchor) -- +(0,-4mm) -| (.child anchor)\forestoption{edge label};
+          }
+        }
+        [fs
+          [file-max]
+          [pipe-max-size]
+          [aio-max-nr]
+        ]
+        [kernel
+          [pid\_max]
+          [sched\_migration\_cost\_ns]
+          [numa\_balancing]
+        ]
+        [net
+          [core
+            [busy\_poll]
+            [netdev\_max\_backlog]
+            [rmem\_max]
+          ]
+          [ipv4
+            [tcp\_window\_scale]
+            [tcp\_congestion\_control]
+            [ip\_forward]
+          ]
+        ]
+        [vm
+          [swappiness]
+          [dirty\_ratio]
+          [min\_free\_kbytes]
+        ]
+      ]
+    \end{forest}
+    
+    \caption{Hierarchical structure of the \texttt{/proc/sys} interface. This view highlights the critical subsystems for performance tuning: filesystem (\texttt{fs}), kernel scheduling (\texttt{kernel}), networking (\texttt{net}), and memory management (\texttt{vm}).}
+    \label{fig:sysctl_tree}
+\end{figure}
+
+Tuning these parameters can yield significant performance benefits, but doing so reliably is difficult:
+\begin{itemize}
+    \item \textbf{Scale:} the configuration space is extremely large (thousands of knobs, many with wide ranges).
+    \item \textbf{Opacity:} it is rarely clear which knobs influence a given application.
+    \item \textbf{Interactions:} knobs interact with each other and with workload characteristics.
+    \item \textbf{Dynamics:} ``best'' settings can change with input diversity, kernel version, and hardware.
+\end{itemize}
+
+Consequently, operators often either leave defaults unchanged or apply generic tuning recipes.
+This leads to sub-optimal performance and increases operational risk.
+
+\section{The Core Challenge: Search Space Explosion}\label{sec:problem-search-space}
+
+Autotuning systems search for configurations that optimize an objective such as throughput, latency, or resource efficiency.
+The literature shows that both Bayesian Optimization and Reinforcement Learning are common choices for such search problems~\cite{stun2022,autotune_survey}.
+However, their effectiveness rapidly degrades as dimensionality grows.
+
+Let $\mathcal{K}$ be the set of all available sysctl kernel knobs, and let $|\mathcal{K}| = d$.
+A configuration is a vector $\mathbf{x} \in \mathcal{X}$ where
+$\mathcal{X} = \mathcal{X}_1 \times \cdots \times \mathcal{X}_d$ and $\mathcal{X}_i$ is the domain of knob $k_i$.
+Even for modest domains, $|\mathcal{X}|$ becomes combinatorially large.
+In practice:
+\begin{itemize}
+    \item Many knobs are irrelevant to a target workload (e.g., USB settings for a database VM).
+    \item Measurement budgets are limited: each trial configuration can require seconds to minutes of runtime.
+    \item The objective function is noisy and non-stationary, resulting in a complicated exploration.
+\end{itemize}
+
+Thus, a naive autotuner that treats all knobs as candidates will be too slow, too costly, and often unstable.
+
+\section{Research Hypothesis}\label{sec:problem-hypothesis}
+
+This thesis is based on the following hypothesis:
+
+\begin{quote}
+\textbf{Hypothesis.} For a given application workload, only a small subset of Linux kernel knobs can actually influence performance; this subset can be approximated \emph{before} tuning begins by analyzing the kernel structure and the application--kernel interaction space.
+\end{quote}
+
+If the hypothesis holds, then an autotuner can focus on a reduced knob set $\mathcal{K}' \subset \mathcal{K}$ (with $|\mathcal{K}'| \ll |\mathcal{K}|$), improving sample efficiency and robustness.
+
+\section{Problem Definition}\label{sec:problem-definition}
+
+We now formalize the problem addressed in this thesis.
+
+\subsection{System model}\label{sec:problem-model}
+
+Instead of modelling a specific application-workload pair, the system model focuses on the operating system itself as a generalized platform for executing arbitrary server workloads. We assume a system characterized by:
+\begin{itemize}
+    \item \textbf{A target OS kernel} $L$ (e.g., a specific Linux kernel version) deployed in a standard server environment (bare-metal, virtual machine, or container).
+    \item \textbf{Core kernel subsystems} $\mathcal{S}$ (such as the network stack, virtual memory manager, and CPU scheduler) that manage hardware resources, handle system calls, and dictate overall system throughput and latency.
+    \item \textbf{A configuration space} $\mathcal{K}$, representing the full, high-dimensional set of runtime-tunable knobs exposed by $L$ (\texttt{sysctl}) that govern the operational policies of the subsystems in $\mathcal{S}$.
+\end{itemize}
+
+\begin{figure}[ht]
+    \centering
+    \begin{tikzpicture}[
+        node distance=2.0cm, % Increased global spacing slightly
+        box/.style={draw, rectangle, rounded corners, minimum width=2.5cm, minimum height=1cm, align=center, fill=white},
+        arrow/.style={->, thick, >=stealth},
+        % CHANGE 1: Increased 'inner sep' to 2.5em to push the label away from the boxes
+        layer/.style={draw, dashed, inner sep=2.5em, label={[anchor=north west, font=\bfseries]north west:#1}}
+    ]
+
+    % --- USER SPACE ---
+    \node[box, fill=blue!10] (agent) {\textbf{Tuning Agent}\\(Your Thesis)};
+    \node[box, right=of agent, fill=gray!10] (cli) {\textbf{sysctl CLI}\\(procps)};
+    \node[box, below=1.0cm of agent] (libc) {\textbf{C Library (glibc)}\\wrapper functions};
+    
+    % --- BOUNDARY ---
+    % Adjusted line length to fit the wider spacing
+    % \draw[thick, red] (-3, -2.8) -- (9, -2.8) node[pos=1, right] {\textbf{User/Kernel Boundary}};
+
+    % --- KERNEL SPACE ---
+    \node[box, below=2.5cm of libc, fill=red!10] (syscall) {\textbf{System Call Interface}\\(\texttt{sys\_sysctl})};
+    \node[box, right=of syscall, fill=red!10] (proc) {\textbf{/proc/sys Handler}\\(procfs)};
+    \node[box, below=1.2cm of syscall, fill=yellow!10] (data) {\textbf{Kernel Data Structures}\\(\texttt{tcp\_retries})};
+
+    % --- ARROWS ---
+    \draw[arrow] (agent) -- (libc) node[midway, right=3pt] {\small write()};
+    \draw[arrow] (cli) |- (libc);
+    \draw[arrow] (libc) -- (syscall) node[midway, right=3pt] {\small syscall / sysenter};
+    
+    % CHANGE 2: Added 'above=5pt' to push text up
+    \draw[arrow] (syscall) -- (proc) node[midway, above=5pt] {\small dispatches};
+    
+    % CHANGE 2: Added 'right=5pt' to push text right
+    \draw[arrow] (proc) -- (data) node[midway, right=5pt] {\small updates value};
+
+    % --- BACKGROUND BOXES ---
+    \begin{scope}[on background layer]
+        \node[fit=(agent)(cli)(libc), layer=User Space, fill=blue!5] {};
+        \node[fit=(syscall)(proc)(data), layer=Kernel Space, fill=red!5] {};
+    \end{scope}
+
+    \end{tikzpicture}
+    \caption{Interaction between User-Space tuning agents and Kernel-Space data structures. The \texttt{sysctl} mechanism acts as a bridge, allowing user-space processes to modify kernel variables via the \texttt{/proc} virtual filesystem.}
+    \label{fig:user_kernel_bridge}
+\end{figure}
+
+Although, downstream autotuners will eventually introduce a specific application $A$ and a workload distribution $W$ to measure real-world performance metrics, our foundational problem operates independently of $A$ and $W$.
+The model relies solely on the internal architecture and source code of $L$ to deduce the structural relationship between the knobs in $\mathcal{K}$ and the performance-critical paths within $\mathcal{S}$.
+
+\subsection{Optimization objective}\label{sec:problem-objective}
+
+The classical autotuning objective is to find:
+\begin{equation}
+    \mathbf{x}^* \in \arg\max_{\mathbf{x} \in \mathcal{X}} f(\mathbf{x}; A, W, L, H)
+\end{equation}
+
+where the components of the equation are formally defined as follows:
+\begin{itemize}
+    \item $\mathbf{x}$: A specific configuration vector, representing a concrete assignment of values to the tunable kernel knobs.
+    \item $\mathbf{x}^*$: the optimal configuration vector that yields the highest performance.
+    \item $\mathcal{X}$: the high-dimensional search space of all possible valid configurations, bounded by the full set of available kernel knobs $\mathcal{K}$.
+    \item $f(\cdot)$: the black-box objective function that measures system performance (e.g., throughput to be maximized, or the inverse of latency to be minimized). Evaluating this function requires executing a benchmark.
+    \item $A$: the target application running on the system (e.g., a specific database, web server, or in-memory cache).
+    \item $W$: the workload distribution driving the application (e.g., specific query mixes, read/write ratios, or request arrival patterns).
+    \item $L$: the target OS kernel acting as the execution environment.
+    \item $H$: the underlying hardware resources (e.g., CPU architecture, memory capacity, storage device) on which the system operates.
+\end{itemize}
+
+This optimization is typically subject to constraints such as safety limits, bounded exploration budgets (limiting the number of times $f$ can be evaluated), and operational policies.
+
+This thesis does \emph{not} propose a new optimizer to evaluate or solve $f(\mathbf{x})$.
+Instead, it addresses a prerequisite sub-problem that many optimizers implicitly require: reducing the dimensionality of the search space $\mathcal{X}$ before the tuning process begins. By mapping the entire space $\mathcal{X}$ to a much smaller, performance-critical subspace $\mathcal{X}'$ (derived from the reduced knob set $\mathcal{K}'$), we make the classical optimization objective computationally tractable for downstream autotuners.
+
+\subsection{Knob selection (search-space reduction) problem}\label{sec:problem-knob-selection}
+
+\textbf{Input:}
+\begin{itemize}
+    \item A Linux kernel version $L$,
+    \item its source code and
+    \item its full set of exposed runtime knobs $\mathcal{K}$.
+\end{itemize}
+
+\textbf{Output:} a universal, workload-agnostic subset of sysctl knobs $\mathcal{K}' \subseteq \mathcal{K}$ that contains parameters with a high potential to affect system performance across diverse workloads.
+Tuning over $\mathcal{K}'$ instead of $\mathcal{K}$ preserves achievable performance gains while drastically reducing the dimensions exposed to the optimizer.
+
+\begin{itemize}
+    \item High \emph{recall}: effectively capture the critical knobs that influence core kernel performance paths.
+    \item Good \emph{reduction factor (precision)}: aggressively filter out knobs that are strictly functional, debugging-related, or performance-neutral to mitigate the curse of dimensionality.
+    \item \emph{Generality}: the resulting subset should serve as a strong starting baseline for any standard workload, delegating workload-specific fine-tuning to the downstream optimizer.
+\end{itemize}
+
+\section{Scope and Non-Goals}\label{sec:problem-scope}
+
+To keep the thesis focused and evaluable, we explicitly define what is in scope.
+
+\subsection{In scope}\label{sec:problem-in-scope}
+
+\begin{itemize}
+    \item \textbf{Runtime kernel knobs}: parameters that can be altered dynamically without recompiling the kernel or restarting the system (e.g., \texttt{sysctl} parameters).
+    \item \textbf{Workload-agnostic selection}: producing a generalized list of potentially performance-critical knobs, rather than profiling a specific application.
+    \item \textbf{Static analysis-driven evidence}: utilizing kernel code structure (e.g., call graphs, data flow, variable usage in critical paths) to infer knob relevance to performance.
+    \item \textbf{Autotuner compatibility}: ensuring the output $\mathcal{K}'$ can be seamlessly ingested as the starting search space by existing tuning frameworks.
+\end{itemize}
+
+\subsection{Out of scope (non-goals)}\label{sec:problem-out-of-scope}
+
+\begin{itemize}
+    \item \textbf{Kernel recompilation and PGO}: compile-time specialization (e.g., profile-guided kernel builds or \texttt{Kconfig} pruning) is reviewed in Chapter~\ref{ch:background}, but is outside the scope of the runtime tuning focus.
+    \item \textbf{Workload-specific dynamic profiling}: running specific applications (like databases or web servers) to trace system calls and filter knobs dynamically is not part of the proposed methodology.
+    \item \textbf{A new optimizer}: we do not attempt to design a system that outperforms state-of-the-art BO/RL optimizers in finding the optimal configuration $\mathbf{x}^*$; the contribution is strictly reducing their input dimensionality.
+    \item \textbf{Embedded and real-time systems}: while the static analysis methodology may apply broadly, the evaluation targets representative server environments.
+\end{itemize}
+
+\section{Key Assumptions}\label{sec:problem-assumptions}
+
+The approach in later chapters relies on several assumptions.
+These assumptions are common in the autotuning literature, but making them explicit clarifies what conclusions can be drawn.
+
+\begin{enumerate}
+    \item \textbf{Workload repeatability}: the workload can be replayed (or approximated) well enough to compare configurations under similar conditions.
+    \item \textbf{Knob accessibility}: the tuning system has permission to read and set the relevant kernel parameters.
+    \item \textbf{Performance observability}: the primary objective metrics can be reliably measured.
+    \item \textbf{Kernel source availability}: because we rely on static analysis, we assume access to the kernel source for the target version $L$.
+\end{enumerate}
+
+\section{Why Existing Approaches Are Insufficient}\label{sec:problem-why-insufficient}
+
+Although the literature provides powerful optimizers and tuning pipelines, the prerequisite step of defining the search space remains a critical bottleneck.
+Common strategies include:
+
+\begin{itemize}
+    \item \textbf{Expert-curated lists}: these are the industry standard but rely entirely on "tribal knowledge". They are labour-intensive to maintain, often outdated as kernel versions evolve, and typically biased towards specific deployment scenarios.
+    \item \textbf{Workload-driven selection (Lasso/Random Forest)}: Methods such as OtterTune~\cite{ottertune} are effective but expensive. They require a "warm-up" phase in which hundreds of benchmarks must be executed to gather enough training data to rank knobs. This defeats the purpose of a low-overhead tuning system.
+    \item \textbf{Documentation scraping}: NLP-based approaches that parse kernel-doc or man pages often fail because documentation is sparse, ambiguous, or describes \textit{functionality} rather than \textit{performance impact}.
+\end{itemize}
+
+This gap motivates a method that can identify high-impact knobs \emph{statically}, by analysing the kernel source code structure, thereby narrowing the search space without requiring expensive profiling runs or human expertise.
+
+\section{Research Questions}\label{sec:problem-rqs}
+
+We structure the thesis around the following research questions (RQs).
+
+\paragraph{RQ1 (Static Identification).}
+\emph{Can we effectively identify performance-critical kernel knobs solely by analysing the static structure of the kernel source code?}
+
+\paragraph{RQ2 (Dimensionality Reduction).}
+\emph{Can such a static analysis reduce the configuration space $\mathcal{K}'$ by at least an order of magnitude (precision) while retaining the knobs necessary to improve system performance?}
+
+\paragraph{RQ3 (Impact on tuning).}
+\emph{Does restricting an autotuner to the selected workload-agnostic set of knobs improve sample efficiency and final performance compared to tuning with a large, generic knob set?}
+
+\paragraph{RQ4 (Evolutionary Robustness).}
+\emph{Is the proposed extraction methodology robust across different kernel versions, automatically adapting to the introduction or deprecation of parameters without manual rule rewriting?}
+
+\section{Requirements and Success Criteria}\label{sec:problem-requirements}
+
+Based on the RQs, we define concrete requirements for the proposed solution.
+
+\subsection{Functional requirements}\label{sec:problem-functional-reqs}
+
+\begin{itemize}
+    \item \textbf{R1: Variable Mapping.} The system must be able to parse the kernel source code to map user-facing sysctl strings (e.g., \texttt{net.core.busy\_poll}) to their corresponding internal C variables.
+    \item \textbf{R2: Structural Identification.} The system must identify specific code patterns that imply performance impact. It should classify a knob as "relevant" if its corresponding variable controls critical logic, such as loop boundaries, conditional branches in hot paths, or memory allocation sizes.
+    \item \textbf{R3: Automated Filtering.} The output must be a filtered subset $\mathcal{K}' \subset \mathcal{K}$ containing only those knobs that satisfy the structural criteria defined in \textbf{R2}.
+    \item \textbf{R4: Framework Compatibility.} The output format must be directly consumable by standard autotuning libraries as a search space definition.
+\end{itemize}
+
+\subsection{Non-functional requirements}\label{sec:problem-nonfunctional-reqs}
+
+\begin{itemize}
+    \item \textbf{R5: Static Operation.} The selection process must not require running the workload or the kernel; it should operate purely on the source tree (offline analysis).
+    \item \textbf{R6: Version Agnostic.} The analysis pipeline should run on standard Linux source trees (e.g., v6.x) without requiring version-specific hardcoding.
+    \item \textbf{R7: Safety by Design.} The selection should inherently deprioritize strictly functional flags (e.g., debug toggles) that do not impact performance metrics, reducing the risk of system instability.
+\end{itemize}
+
+\subsection{Evaluation criteria}\label{sec:problem-eval-criteria}
+
+We evaluate the approach using metrics that reflect both knob selection quality and end-to-end tuning impact:
+\begin{itemize}
+    \item \textbf{Selection size reduction}: compression of the search space, defined as $1 - \frac{|\mathcal{K}'|}{|\mathcal{K}|}$.
+    \item \textbf{Downstream tuning efficiency}: time/samples required to reach a target performance.
+    \item \textbf{Achieved performance}: best throughput achieved over a non-optimal configuration.
+    \item \textbf{Cross-Workload Generality}: The variance in performance gains when applying the \emph{same} static knob set to fundamentally different applications (e.g., PostgreSQL vs. Nginx).
+\end{itemize}
+
+% \section{Thesis Roadmap}\label{sec:problem-roadmap}
+
+% The remainder of the thesis addresses the problem as follows:
+
+% \begin{itemize}
+%     \item \textbf{Chapter~\ref{ch:methodology} (Methodology)} details the static analysis pipeline, including the parsing of the Linux source code, the strategy for mapping user-level \texttt{sysctl} strings to internal kernel variables, and the structural filtering rules used to identify performance-critical code paths.
+%     \item \textbf{Chapter~\ref{ch:evaluation} (Evaluation)} validates the proposed method by quantifying the search space reduction and assessing the quality of the selected knobs. It demonstrates the impact of using this reduced set in downstream autotuning scenarios compared to expert-curated baselines.
+%     \item \textbf{Chapter~\ref{ch:future_work} (Future Work)} discusses the limitations of a purely static approach (e.g., handling indirect pointers or runtime dependencies) and outlines promising directions for research, such as hybrid static-dynamic analysis.
+%     \item \textbf{Chapter~\ref{ch:conclusion} (Conclusion)} summarizes the main contributions of the thesis and offers final remarks on the feasibility of workload-agnostic search space reduction.
+% \end{itemize}
+
+\newpage

@@ -1,0 +1,27 @@
+\chapter{Conclusion} \label{ch:conclusion}
+
+Modern operating systems are designed to be general-purpose, shipped with default configuration parameters intended to provide acceptable performance across a vast spectrum of use cases.
+However, as demonstrated throughout this thesis, "acceptable" is inherently suboptimal for high-performance, high-concurrency environments.
+The sheer volume of configurable \textit{sysctl} parameters within the Linux kernel coupled with the complex, undocumented interactions between them has traditionally turned system tuning into a manual, error-prone methodology heavily reliant on domain expertise.
+Furthermore, while automated machine learning tuners offer a solution, they are frequently overwhelmed by the curse of dimensionality when confronted with the kernel massive parameter search space.
+
+This thesis was aimed to resolve this bottleneck by proposing a fundamentally novel, application-agnostic methodology for identifying critical kernel configuration parameters.
+Rather than relying on trial-and-error or heuristic-based application profiling, this research moved the analysis entirely into the kernel space.
+
+By engineering a robust static analysis pipeline, we successfully mapped the top-down control flow of application system calls and intersected them with the bottom-up data flow of sysctl parameter evaluations.
+This intersection statically proved which configuration knobs directly influence an application execution path.
+The resulting framework successfully reduced thousands of available kernel parameters down to a highly targeted, execution-path-specific subset, effectively providing the precise, low-dimensional search space required for automated tuning algorithms to function efficiently.
+
+The empirical evaluation of this methodology resulted in significant, measurable successes.
+By feeding the statically derived subset of networking knobs into a Bayesian Optimization framework, substantial throughput improvements across diverse, real-world web servers was achieved.
+The tuning processes yielded performance gains of up to $23\%$ for the Apache HTTP Server and $\sim 15\%$ for both NGINX and HAProxy.
+
+More importantly, the evaluation phase conclusively validated the core hypothesis: a universal, "one-size-fits-all" kernel configuration does not exist.
+The automated framework successfully captured how critical system bottlenecks dynamically shift based on user-space architecture and traffic profiles.
+For thread-heavy applications like Apache, performance was dictated by CPU preservation (disabling \texttt{busy\_poll}).
+Conversely, for lightweight, event-driven architectures like NGINX and HAProxy, the bottlenecks shifted entirely to raw TCP data transmission mechanics for large payloads (\texttt{tcp\_window\_scaling}).
+
+Ultimately, this research bridges a critical gap between operating system static analysis and automated optimization.
+By proving that the optimal search space of tuning parameters can be identified systematically and agnostically, merely by looking at the kernel paths an application invokes, this thesis lays the essential groundwork for the next generation of autonomous optimization frameworks.
+
+\newpage
