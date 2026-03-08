@@ -140,7 +140,7 @@ Instead of modelling a specific application-workload pair, the system model focu
     ]
 
     % --- USER SPACE ---
-    \node[box, fill=blue!10] (agent) {\textbf{Tuning Agent}\\(Your Thesis)};
+    \node[box, fill=blue!10] (agent) {\textbf{Tuning Agent}};
     \node[box, right=of agent, fill=gray!10] (cli) {\textbf{sysctl CLI}\\(procps)};
     \node[box, below=1.0cm of agent] (libc) {\textbf{C Library (glibc)}\\wrapper functions};
     
@@ -220,109 +220,55 @@ Tuning over $\mathcal{K}'$ instead of $\mathcal{K}$ preserves achievable perform
     \item \emph{Generality}: the resulting subset should serve as a strong starting baseline for any standard workload, delegating workload-specific fine-tuning to the downstream optimizer.
 \end{itemize}
 
-\section{Scope and Non-Goals}\label{sec:problem-scope}
+\section{Scope and Contributions}\label{sec:problem-scope}
 
-To keep the thesis focused and evaluable, we explicitly define what is in scope.
+To establish a clear boundary for this research, it is crucial to explicitly separate the core contributions of this thesis from the mechanisms used to evaluate them.
 
-\subsection{In scope}\label{sec:problem-in-scope}
+The strict focus of this work is the static identification and dimensionality reduction of kernel configuration parameters.
+Specifically, the methodology targets runtime kernel knobs (such as \textit{sysctl} parameters) that can be dynamically altered without recompiling the operating system.
+The primary contribution is a static analysis pipeline that leverages kernel code structure (mapping data flows and tracking variable usage within execution paths) to infer which specific parameters actively influence system behaviour.
 
-\begin{itemize}
-    \item \textbf{Runtime kernel knobs}: parameters that can be altered dynamically without recompiling the kernel or restarting the system (e.g., \texttt{sysctl} parameters).
-    \item \textbf{Workload-agnostic selection}: producing a generalized list of potentially performance-critical knobs, rather than profiling a specific application.
-    \item \textbf{Static analysis-driven evidence}: utilizing kernel code structure (e.g., call graphs, data flow, variable usage in critical paths) to infer knob relevance to performance.
-    \item \textbf{Autotuner compatibility}: ensuring the output $\mathcal{K}'$ can be seamlessly ingested as the starting search space by existing tuning frameworks.
-\end{itemize}
+Crucially, this methodology is completely decoupled from the runtime execution of any specific application.
+It does not actively monitor, trace, or analyse the system call footprint of a live workload.
+Instead, the pipeline simply accepts a predefined set of system calls as its input.
+Given this input set, it statically traces the corresponding kernel execution paths to extract the relevant configuration parameters.
+The system never needs to run an application, simulate traffic, or measure live telemetry to filter the search space.
+By operating purely through offline source code analysis, it yields a highly targeted parameter subset based entirely on the intersection of the requested system calls and the kernel data flow.
 
-\subsection{Out of scope (non-goals)}\label{sec:problem-out-of-scope}
+\section{The Role of Autotuning (Non-Goal)}
 
-\begin{itemize}
-    \item \textbf{Kernel recompilation and PGO}: compile-time specialization (e.g., profile-guided kernel builds or \texttt{Kconfig} pruning) is reviewed in Chapter~\ref{ch:background}, but is outside the scope of the runtime tuning focus.
-    \item \textbf{Workload-specific dynamic profiling}: running specific applications (like databases or web servers) to trace system calls and filter knobs dynamically is not part of the proposed methodology.
-    \item \textbf{A new optimizer}: we do not attempt to design a system that outperforms state-of-the-art BO/RL optimizers in finding the optimal configuration $\mathbf{x}^*$; the contribution is strictly reducing their input dimensionality.
-    \item \textbf{Embedded and real-time systems}: while the static analysis methodology may apply broadly, the evaluation targets representative server environments.
-\end{itemize}
+It must be explicitly stated that designing, building, or improving an automated tuning optimization algorithm (such as a new Bayesian Optimization or reinforcement learning model) is strictly out of scope for this thesis.
 
-\section{Key Assumptions}\label{sec:problem-assumptions}
+In contrast, in this research an existing autotuning framework is utilized solely as a validation instrument.
+By feeding the set of statically reduced parameters into an existing autotuner, we can empirically verify whether the identification pipeline successfully retained the most influential knobs while discarding the noise.
+The autotuner serves only to demonstrate that our dimensionality reduction accelerates convergence and unlocks meaningful performance gains.
 
-The approach in later chapters relies on several assumptions.
-These assumptions are common in the autotuning literature, but making them explicit clarifies what conclusions can be drawn.
+Other areas outside the scope of this research include compile-time kernel specializations (such as profile-guided optimizations or \textit{Kconfig} pruning) and the tuning of embedded or hard real-time systems, as our evaluation specifically targets representative cloud server environments.
 
+\section{The Search Space Bottleneck}
+
+The necessity of this static analysis approach becomes apparent when evaluating the current landscape of automated system tuning.
+While the literature provides incredibly powerful optimizers, the prerequisite step of defining the search space remains a critical bottleneck.
+
+The reliance on expert-curated list of parameters is labour-intensive, highly biased toward specific historical deployment scenarios, and rapidly becomes obsolete as kernel versions evolve.
+Alternatively, workload-driven feature selection methods (such as Lasso~\cite{lasso} regression or Random Forests~\cite{random_forests}) are effective but operationally expensive.
+They require a dynamic warm-up phase in which hundreds of benchmarking permutations must be executed against a live system simply to gather enough training data to rank the relevance of the knobs.
+This massive cost defeats the purpose of a low-overhead tuning system.
+Finally, attempts to automate selection via natural language processing (parsing kernel documentation or man pages) frequently fail because documentation is sparse and typically describes parameter functionality rather than actual performance impact.
+
+This systemic gap motivates the proposed methodology: narrowing the configuration search space statically, without requiring expensive dynamic profiling runs or human domain expertise.
+
+\section{Research Questions and Evaluation Criteria}
+
+To structure the evaluation of this methodology, this thesis addresses the following core research questions:
 \begin{enumerate}
-    \item \textbf{Workload repeatability}: the workload can be replayed (or approximated) well enough to compare configurations under similar conditions.
-    \item \textbf{Knob accessibility}: the tuning system has permission to read and set the relevant kernel parameters.
-    \item \textbf{Performance observability}: the primary objective metrics can be reliably measured.
-    \item \textbf{Kernel source availability}: because we rely on static analysis, we assume access to the kernel source for the target version $L$.
+    \item \textbf{Static identification}: can we effectively map user-facing \textit{sysctl} strings to their internal C variables and identify their performance relevance solely by analysing the static structure of the Linux kernel source code?
+    \item \textbf{Dimensionality reduction}: can this static analysis successfully compress the vast configuration space, isolating a highly targeted subset of knobs?
+    \item \textbf{Impact on tuning}: when an off-the-shelf autotuner is restricted to this statically derived subset, does the noise reduction lead to improved sample efficiency (requiring fewer benchmarking iterations to reach convergence) while achieving superior final throughput compared to tuning blindly across a generic knob set?
+    \item \textbf{Evolutionary robustness}: is this extraction methodology robust across different kernel versions, automatically adapting to the introduction or deprecation of parameters without requiring manual rule rewriting?
 \end{enumerate}
 
-\section{Why Existing Approaches Are Insufficient}\label{sec:problem-why-insufficient}
-
-Although the literature provides powerful optimizers and tuning pipelines, the prerequisite step of defining the search space remains a critical bottleneck.
-Common strategies include:
-
-\begin{itemize}
-    \item \textbf{Expert-curated lists}: these are the industry standard but rely entirely on "tribal knowledge". They are labour-intensive to maintain, often outdated as kernel versions evolve, and typically biased towards specific deployment scenarios.
-    \item \textbf{Workload-driven selection (Lasso/Random Forest)}: Methods such as OtterTune~\cite{ottertune} are effective but expensive. They require a "warm-up" phase in which hundreds of benchmarks must be executed to gather enough training data to rank knobs. This defeats the purpose of a low-overhead tuning system.
-    \item \textbf{Documentation scraping}: NLP-based approaches that parse kernel-doc or man pages often fail because documentation is sparse, ambiguous, or describes \textit{functionality} rather than \textit{performance impact}.
-\end{itemize}
-
-This gap motivates a method that can identify high-impact knobs \emph{statically}, by analysing the kernel source code structure, thereby narrowing the search space without requiring expensive profiling runs or human expertise.
-
-\section{Research Questions}\label{sec:problem-rqs}
-
-We structure the thesis around the following research questions (RQs).
-
-\paragraph{RQ1 (Static Identification).}
-\emph{Can we effectively identify performance-critical kernel knobs solely by analysing the static structure of the kernel source code?}
-
-\paragraph{RQ2 (Dimensionality Reduction).}
-\emph{Can such a static analysis reduce the configuration space $\mathcal{K}'$ by at least an order of magnitude (precision) while retaining the knobs necessary to improve system performance?}
-
-\paragraph{RQ3 (Impact on tuning).}
-\emph{Does restricting an autotuner to the selected workload-agnostic set of knobs improve sample efficiency and final performance compared to tuning with a large, generic knob set?}
-
-\paragraph{RQ4 (Evolutionary Robustness).}
-\emph{Is the proposed extraction methodology robust across different kernel versions, automatically adapting to the introduction or deprecation of parameters without manual rule rewriting?}
-
-\section{Requirements and Success Criteria}\label{sec:problem-requirements}
-
-Based on the RQs, we define concrete requirements for the proposed solution.
-
-\subsection{Functional requirements}\label{sec:problem-functional-reqs}
-
-\begin{itemize}
-    \item \textbf{R1: Variable Mapping.} The system must be able to parse the kernel source code to map user-facing sysctl strings (e.g., \texttt{net.core.busy\_poll}) to their corresponding internal C variables.
-    \item \textbf{R2: Structural Identification.} The system must identify specific code patterns that imply performance impact. It should classify a knob as "relevant" if its corresponding variable controls critical logic, such as loop boundaries, conditional branches in hot paths, or memory allocation sizes.
-    \item \textbf{R3: Automated Filtering.} The output must be a filtered subset $\mathcal{K}' \subset \mathcal{K}$ containing only those knobs that satisfy the structural criteria defined in \textbf{R2}.
-    \item \textbf{R4: Framework Compatibility.} The output format must be directly consumable by standard autotuning libraries as a search space definition.
-\end{itemize}
-
-\subsection{Non-functional requirements}\label{sec:problem-nonfunctional-reqs}
-
-\begin{itemize}
-    \item \textbf{R5: Static Operation.} The selection process must not require running the workload or the kernel; it should operate purely on the source tree (offline analysis).
-    \item \textbf{R6: Version Agnostic.} The analysis pipeline should run on standard Linux source trees (e.g., v6.x) without requiring version-specific hardcoding.
-    \item \textbf{R7: Safety by Design.} The selection should inherently deprioritize strictly functional flags (e.g., debug toggles) that do not impact performance metrics, reducing the risk of system instability.
-\end{itemize}
-
-\subsection{Evaluation criteria}\label{sec:problem-eval-criteria}
-
-We evaluate the approach using metrics that reflect both knob selection quality and end-to-end tuning impact:
-\begin{itemize}
-    \item \textbf{Selection size reduction}: compression of the search space, defined as $1 - \frac{|\mathcal{K}'|}{|\mathcal{K}|}$.
-    \item \textbf{Downstream tuning efficiency}: time/samples required to reach a target performance.
-    \item \textbf{Achieved performance}: best throughput achieved over a non-optimal configuration.
-    \item \textbf{Cross-Workload Generality}: The variance in performance gains when applying the \emph{same} static knob set to fundamentally different applications (e.g., PostgreSQL vs. Nginx).
-\end{itemize}
-
-% \section{Thesis Roadmap}\label{sec:problem-roadmap}
-
-% The remainder of the thesis addresses the problem as follows:
-
-% \begin{itemize}
-%     \item \textbf{Chapter~\ref{ch:methodology} (Methodology)} details the static analysis pipeline, including the parsing of the Linux source code, the strategy for mapping user-level \texttt{sysctl} strings to internal kernel variables, and the structural filtering rules used to identify performance-critical code paths.
-%     \item \textbf{Chapter~\ref{ch:evaluation} (Evaluation)} validates the proposed method by quantifying the search space reduction and assessing the quality of the selected knobs. It demonstrates the impact of using this reduced set in downstream autotuning scenarios compared to expert-curated baselines.
-%     \item \textbf{Chapter~\ref{ch:future_work} (Future Work)} discusses the limitations of a purely static approach (e.g., handling indirect pointers or runtime dependencies) and outlines promising directions for research, such as hybrid static-dynamic analysis.
-%     \item \textbf{Chapter~\ref{ch:conclusion} (Conclusion)} summarizes the main contributions of the thesis and offers final remarks on the feasibility of workload-agnostic search space reduction.
-% \end{itemize}
+The success of the proposed system is evaluated against these questions using tangible metrics.
+These include the percentage by which the search space is mathematically compressed and the application throughput achieved over the non-optimal kernel configuration.
 
 \newpage

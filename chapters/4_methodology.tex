@@ -210,7 +210,11 @@ This silent truncation is a prime example of how \textit{sysctl} configurations 
 
 \section{The Knob Analyser Framework}
 
-To track the influence of configuration parameters within the kernel, this research leverages an existing static analysis framework, hereafter referred to as the \textit{Knob Analyser}. The primary function of the Knob Analyser is to determine the complete sphere of influence a given \textit{sysctl} knob possesses within the kernel source code.
+To track the influence of configuration parameters within the kernel, this research leverages an existing static analysis framework, hereafter referred to as the \textit{Knob Analyser}.
+It must be stated explicitly that the development of the Knob Analyser is not a novel contribution of this thesis.
+Rather, it is a prior work that has been adopted and integrated as a foundational component of the broader identification pipeline.
+The primary function of the Knob Analyser within the methodology is to determine the complete sphere of influence a given \textit{sysctl} knob possesses.
+By mapping the parameter data flow and control dependencies, the analyser systematically traces how and where a knob value propagates throughout the kernel source code.
 
 When a \textit{sysctl} parameter is modified, it updates specific memory locations—often variables tied to the kernel internal state.
 The Knob Analyser performs a bottom-up analysis, beginning at the specific handler or variable bound to the \textit{sysctl} entry.
@@ -694,13 +698,16 @@ The end-to-end execution flow is visualized in Figure~\ref{fig:overall_architect
     \item Output Stage: the system outputs a definitive, list of critical \textit{sysctl} knobs that reside on the application execution path, ready for performance tuning.
 \end{enumerate}
 
-\begin{figure}[htbp]
+\begin{figure}
     \centering
-    \resizebox{0.75\textwidth}{!}{
     \begin{tikzpicture}[
         node distance=0.8cm and 0.8cm,
         % Styles
         inputbox/.style={draw, rectangle, rounded corners, fill=gray!10, minimum width=2.8cm, minimum height=0.8cm, align=center, font=\footnotesize\sffamily},
+        % Style for Prior Work
+        priorbox/.style={draw=gray!80, rectangle, rounded corners, fill=gray!15, minimum width=4cm, minimum height=1cm, align=center, font=\footnotesize\sffamily, dashed, text=black!90},
+        priordata/.style={draw=gray!80, cylinder, shape border rotate=90, aspect=0.25, fill=gray!15, minimum height=1cm, minimum width=1.8cm, align=center, font=\scriptsize\ttfamily, dashed, text=black!90},
+        % Contribution Styles
         enginebox/.style={draw, rectangle, rounded corners, fill=blue!10, minimum width=4cm, minimum height=1cm, align=center, font=\textbf\footnotesize\sffamily, thick},
         databox/.style={draw, cylinder, shape border rotate=90, aspect=0.25, fill=yellow!10, minimum height=1cm, minimum width=1.8cm, align=center, font=\scriptsize\ttfamily},
         logicbox/.style={draw, diamond, aspect=1.8, fill=purple!10, minimum width=3cm, minimum height=1.2cm, align=center, font=\footnotesize\sffamily},
@@ -708,56 +715,109 @@ The end-to-end execution flow is visualized in Figure~\ref{fig:overall_architect
         arrow/.style={->, >=stealth, thick},
         groupbox/.style={draw, rectangle, dashed, rounded corners, inner sep=10pt, fill=black!2}
     ]
-
-    % --- Stage 1: Inputs ---
-    \node (llvm) [inputbox] {Linux Kernel\\LLVM IR Bitcode};
-    % Increased right distance to 2.5cm to pull the blue boxes apart
-    \node (profile) [inputbox, right=2.5cm of llvm] {Workload Profile\\(Syscall Context)};
-
-    % --- Stage 2: Parallel Analysis ---
-    \node (knob_engine) [enginebox, below=1cm of llvm] {Knob Analyser\\(Bottom-Up Data Flow)};
-    \node (sys_engine) [enginebox, below=1cm of profile] {Syscall Analyser\\(Top-Down Control Flow)};
     
-    % Group box for Stage 2
-    \begin{pgfonlayer}{background}
-        \node [groupbox, fit=(knob_engine) (sys_engine), label=left:\rotatebox{90}{\textbf{\footnotesize Parallel Analysis}}] {};
-    \end{pgfonlayer}
-
-    % --- Intermediate Data ---
-    \node (gk) [databox, below=0.8cm of knob_engine] {Knob Graphs\\$G_k = (V_k, E_k)$};
-    \node (gs) [databox, below=0.8cm of sys_engine] {Syscall Graphs\\$G_s = (V_s, E_s)$};
-
-    % --- Stage 3: Intersection Engine ---
-    % Adjusted xshift to perfectly center between the newly widened columns
-    \node (intersect) [logicbox, below=1cm of gk, xshift=2.65cm] {Intersection \& \\ Scoring Engine \\ $V_k \cap V_s$};
-
-    % --- Stage 4: Outputs ---
-    % Increased the vertical drop (from 0.8cm to 1.5cm) to move them more down
-    \node (out_min) [outputbox, below left=1.5cm and 0.2cm of intersect] {Ordered Critical Knobs\\(by $\Delta_{min}$ Ascending)};
-    \node (out_max) [outputbox, below right=1.5cm and 0.2cm of intersect] {Ordered Critical Knobs\\(by $\Delta_{max}$ Descending)};
-
-    % --- Connections ---
-    % Inputs to Engines
-    \draw [arrow] (llvm) -- (knob_engine);
-    \draw [arrow] (llvm) -- (sys_engine);
-    \draw [arrow] (profile) -- (sys_engine);
-
-    % Engines to Data
-    \draw [arrow] (knob_engine) -- (gk);
-    \draw [arrow] (sys_engine) -- (gs);
-
-    % Data to Intersection
-    \draw [arrow] (gk) -- (intersect.north west);
-    \draw [arrow] (gs) -- (intersect.north east);
-
-    % Intersection to Outputs
-    \draw [arrow] (intersect.south) -- (out_min.north);
-    \draw [arrow] (intersect.south) -- (out_max.north);
-
+        % --- Stage 1: Inputs ---
+        \node (llvm) [inputbox] {Linux Kernel\\LLVM IR Bitcode};
+        \node (knob_name) [inputbox, left=1cm of llvm] {Knob Name}; 
+        \node (profile) [inputbox, right=1cm of llvm] {System Call};
+    
+        % --- Stage 2: Parallel Analysis ---
+        % Engines are aligned directly below their specific inputs
+        \node (knob_engine) [priorbox, below=1cm of knob_name] {Knob Analyser\\(Bottom-Up Data Flow)};
+        \node (sys_engine) [enginebox, below=1cm of profile] {Syscall Analyser\\(Top-Down Control Flow)};
+        
+        % --- Intermediate Data ---
+        \node (gk) [priordata, below=0.8cm of knob_engine] {Knob Graphs\\$G_k = (V_k, E_k)$};
+        \node (gs) [databox, below=0.8cm of sys_engine] {Syscall Graphs\\$G_s = (V_s, E_s)$};
+    
+        % --- Background Box for Parallel Analysis ---
+        \begin{pgfonlayer}{background}
+            \node [groupbox, fit=(knob_engine) (sys_engine), label=left:\rotatebox{90}{\textbf{\footnotesize Parallel Analysis}}] {};
+        \end{pgfonlayer}
+    
+        % --- Stage 3: Intersection Engine ---
+        % Centered perfectly relative to the LLVM node at the top
+        \node (intersect) [logicbox, below=4.5cm of llvm] {Intersection \& \\ Scoring Engine \\ $V_k \cap V_s$};
+    
+        % --- Stage 4: Outputs ---
+        \node (out_min) [outputbox, below left=1.5cm and 0.2cm of intersect] {Ordered Critical Knobs\\(by $\Delta_{min}$ Ascending)};
+        \node (out_max) [outputbox, below right=1.5cm and 0.2cm of intersect] {Ordered Critical Knobs\\(by $\Delta_{max}$ Descending)};
+    
+        % --- Connections ---
+        \draw [arrow, gray!80, dashed] (knob_name) -- (knob_engine); 
+        \draw [arrow, gray!80, dashed] (llvm) -- (knob_engine); % Diagonal dashed line from center LLVM
+        \draw [arrow] (llvm) -- (sys_engine); % Diagonal solid line from center LLVM
+        \draw [arrow] (profile) -- (sys_engine);
+        \draw [arrow, gray!80, dashed] (knob_engine) -- (gk);
+        \draw [arrow] (sys_engine) -- (gs);
+        \draw [arrow] (gk) -- (intersect.north west);
+        \draw [arrow] (gs) -- (intersect.north east);
+        \draw [arrow] (intersect.south) -- (out_min.north);
+        \draw [arrow] (intersect.south) -- (out_max.north);
+    
+        % --- Legend ---
+        \begin{scope}[shift={(intersect.south)}, yshift=-3cm]
+            \node (leg_prior) [priorbox, minimum width=0.8cm, minimum height=0.5cm, label=right:{\footnotesize Prior Work}] {};
+        \end{scope}
     \end{tikzpicture}
-    }
-    \caption{The end-to-end static analysis pipeline. The framework ingests kernel bitcode and workload profiles, parallelizes the bottom-up knob mapping and top-down syscall tracing, and strictly computes their topological intersection to produce a minimal set of tuning parameters.}
+    \caption{The end-to-end static analysis pipeline. The framework ingests kernel bit-code and workload profiles, parallelizes the bottom-up knob mapping and top-down syscall tracing, and strictly computes their topological intersection to produce a minimal set of tuning parameters.}
     \label{fig:overall_architecture}
 \end{figure}
+
+\section{Evaluation Methodology}
+
+To rigorously validate the static analysis pipeline and the efficacy of the resulting reduced parameter search space, a two-part evaluation methodology was designed.
+The first phase focuses on structural verification to ensure the static graphs remain accurate after pruning, while the second phase focuses on empirical performance testing under varied, real-world traffic profiles.
+
+\subsection{Verification of Graph Completeness via Dynamic Tracing} \label{subsec:methodology_dynamic_tracing}
+
+While aggressive node reduction is necessary to solve the dimensionality problem, it introduces the risk of over-approximation.
+Specifically, the evaluation methodology must ensure that the context-sensitive pruning logic does not erroneously remove essential execution paths (false negatives) that the application actively relies on at runtime.
+To verify that all necessary kernel functions remain present in the pruned static graphs, the methodology employs dynamic runtime tracing.
+By executing the targeted workloads and dynamically tracing the active function call stacks for a given system call, it is possible to generate flame graphs that visualize the exact, ground-truth execution paths taken by the kernel in a live environment.
+For example, by dynamically tracing the \texttt{read} or \texttt{write} operations under a standard TCP/IPv4 networking workload, the exact call stack transitioning from the generic Virtual File System (VFS) layer to specific protocol implementations (such as \texttt{tcp\_recvmsg}) can be captured.
+
+\paragraph{Tools and Experimental Setup.}
+The dynamic profiling was conducted on a Linux-based virtual machine.
+The primary instrumentation tool utilized was Linux \textit{perf}, which allows for low-overhead, system-wide profiling of performance counters and precise stack trace capture.
+Traffic generation was handled using \textit{netcat} (nc) to establish controlled TCP client-server connections, while the visualization of the resulting call stacks was achieved using Brendan Gregg’s \textit{FlameGraph} toolkit~\cite{flame_graphs}.
+
+\paragraph{Execution Modality and Duration.}
+To capture a high-fidelity profile of specific system calls (such as \texttt{sys\_write}), a synthetic workload was designed to intentionally saturate the CPU with the target operation.
+For the transmission profile, a local TCP server was initialized to listen for incoming data, while a client piped an infinite stream of characters to the server (e.g., using the \textit{yes} command piped into \textit{nc}).
+This tight loop forced the kernel to repeatedly invoke the target system call, continuously driving execution down into the TCP stack.
+During this load generation phase, \textit{perf} record was initiated in the background to sample call graphs across all available CPUs.
+The sampling window was set to a duration of 5 seconds.
+This duration was chosen because it provides a statistically significant volume of stack traces to capture the complete execution path, without overflowing the trace buffers or introducing excessive noise from unrelated background system tasks.
+
+\paragraph{Verification Criteria.}
+The generated flame graph visualizes the hierarchical call stack, where the Y-axis represents the depth and chain of function calls.
+The strict criterion for verification is a direct intersection test, where the dynamically invoked functions extracted from the flame graph must exist within the nodes of the statically pruned graph.
+If the critical dynamic frames (e.g., \texttt{tcp\_sendmsg}, \texttt{ip\_output}) are successfully located within the static graph, the verification is considered successful.
+This empirical overlap proves that the context-sensitive pruning strategy aggressively reduces overall graph complexity while safely preserving the structural completeness required for accurate sysctl knob discovery.
+
+\subsection{Knob Relevance Verification} \label{subsec:knob_relevanve_verification}
+
+To accurately evaluate whether the static analysis pipeline successfully extracted performance-critical \textit{sysctl} knobs, it is essential to subject the resulting parameter subset to empirical, runtime verification.
+
+To achieve this, the evaluation methodology utilizes \textbf{Autotune}, an existing, external automated tuning framework.
+It must be explicitly stated that the design and algorithmic implementation of Autotune (which relies on Bayesian Optimization) are not original contributions of this thesis.
+Instead, Autotune acts strictly as an evaluation instrument.
+By restricting the autotuner search space exclusively to the mathematically reduced knob set generated by our static analysis, we can observe its tuning efficiency and final performance gains.
+If the autotuner successfully optimizes the system using only this restricted subset, it definitively proves that the methodology isolated the correct, highly relevant parameters.
+
+\subsubsection{Workload Characterization} \label{subsec:methodology_workload}
+
+Verifying knob relevance requires testing against distinct traffic patterns.
+Different network behaviours traverse different execution paths within the Linux kernel, thereby shifting the physical bottlenecks of the system.
+Testing different workloads is a crucial aspect of this evaluation methodology because a universal, ``one-size-fits-all'' configuration does not exist within the Linux kernel.
+A parameter that maximizes raw data throughput (such as vastly expanding TCP memory buffers) might inadvertently increase queuing delays (buffer-bloat), severely degrading latency.
+In contrast, optimizing the kernel for rapid connection cycling can introduce CPU overhead that degrades sustained data transfer rates.
+
+To simulate these varying conditions and observe how the automated tuning framework adapts its parameter selection, the HTTP benchmarking tool \textit{wrk} (version 5.2.0) is utilized to generate two distinct load profiles:
+\begin{itemize}
+    \item \textbf{Workload A (High Concurrency / Short-Lived Connections)}: this profile was generated by repeatedly requesting a small, $\sim 1kB$ static file. Because the payload is negligible, the network transaction completes almost instantly. This workload forces the server to constantly open and close thousands of connections per second. It aggressively stresses the kernel connection management subsystem, specifically testing the efficiency of TCP handshakes and teardowns, the capacity of the \texttt{SYN} backlog, and the management of sockets in the \texttt{TIME\_WAIT} state.
+    \item \textbf{Workload B (High Throughput / Large Payloads)}: this profile was generated by requesting the default \textit{test.html} file provided by \textit{wrk}, which is approximately $\sim 100kB$ in size. In this scenario, the server handles fewer overall connection requests but must push significantly more data per connection. This workload shifts the primary system bottleneck away from connection establishment and places it squarely on the kernel data transmission mechanisms. It heavily stresses TCP window scaling, socket memory buffer allocations, and congestion control algorithms to ensure high-bandwidth data delivery.
+\end{itemize}
 
 \newpage

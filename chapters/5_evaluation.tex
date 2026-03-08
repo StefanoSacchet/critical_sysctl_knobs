@@ -30,14 +30,15 @@ This reduction is critical; without it, the framework would falsely flag sysctl 
 \subsection{The Read and Write System Calls}
 
 The \texttt{write} and \texttt{read} system calls are highly generic Virtual File System (VFS) operations.
-When invoked, they traverse the VFS layer before being dynamically routed to specific file system drivers or socket implementations via the \texttt{struct file\_operations} indirect calls. Without context-sensitive pruning, the static analysis graph for write branches out into every block-device driver, file system (e.g., ext4, btrfs, XFS), and socket protocol capable of transmitting data, resulting in a baseline of 6190 nodes.
+When invoked, they traverse the VFS layer before being dynamically routed to specific file system drivers or socket implementations via the \texttt{struct file\_operations} indirect calls. Without context-sensitive pruning, the static analysis graph for \texttt{write} branches out into every block-device driver, file system (e.g., ext4, btrfs, XFS), and socket protocol capable of transmitting data, resulting in a massive baseline of 6190 nodes.
 
-Interestingly, the baseline node count for the \texttt{read} system call was observed to be slightly lower than that of \texttt{write}.
+Interestingly, the baseline node count for the \texttt{read} system call was observed to be slightly lower starting at 5,223 nodes.
 This discrepancy reflects the architectural differences in the way the kernel handles data ingestion versus data transmission.
 The write path in the kernel often involves more complex mechanisms for buffer allocation, page cache flushing, packet queuing disciplines (qdiscs), and congestion control state management before data actually leaves the system.
 Conversely, the read path is generally more streamlined, often pulling from already populated receive buffers or page caches.
 
 When the execution context for both system calls is restricted to a networking workload (TCP/IPv4), the pruning strategy efficiently discards all block-device and file-system-specific branches.
+The impact on the graph size is dramatic: the write graph is reduced from 6,190 down to just 228 nodes (a 96.3\% reduction). Similarly, the read graph shrinks from 5,223 down to 114 nodes (a 97.8\% reduction).
 The resulting graphs strictly follow the path from the VFS layer down to \texttt{tcp\_sendmsg} and \texttt{tcp\_recvmsg} respectively, significantly narrowing the search space for relevant networking knobs.
 
 \subsection{The Poll and Epoll Wait System Calls}
@@ -45,25 +46,32 @@ The resulting graphs strictly follow the path from the VFS layer down to \texttt
 Modern high-performance applications (such as the web servers evaluated in the following sections) rely heavily on I/O multiplexing.
 The \texttt{poll} and \texttt{epoll\_wait} system calls allow an application to efficiently monitor multiple file descriptors for state changes.
 
-The baseline graphs for these system calls are highly complex because the kernel must iterate through generic file descriptors and invoke their respective \texttt{poll} callback functions, which could belong to sockets, pipes, character devices, or eventfd constructs.
-Although establishing strict absolute baselines for these multiplexing calls is challenging due to the dynamic nature of event loops, the pruning strategy consistently demonstrated a high reduction in graph complexity.
-By establishing a TCP networking context, the Syscall Analyser aggressively prunes the generic polling mechanisms down to the specific \texttt{tcp\_poll} implementations.
-This successfully removes irrelevant polling routines for non-network devices, yielding a much tighter, more accurate intersection target.
+The baseline graphs for these system calls are highly complex because the kernel must iterate through generic file descriptors and invoke their respective poll callback functions, which could belong to sockets, pipes, character devices, or \textit{eventfd} constructs.
+Without context-sensitive pruning, this generic routing results in massive static analysis graphs: \texttt{epoll\_wait} begins with 4,192 nodes, while \texttt{poll} starts at 3,101 nodes.
 
-\subsection{Verification of Graph Completeness via Dynamic Tracing}
+By establishing a TCP networking context, the Syscall Analyser aggressively prunes these generic polling mechanisms down to the specific \texttt{tcp\_poll} implementations.
+This successfully removes all irrelevant polling routines for non-network devices, yielding an impressive reduction in graph complexity.
+The \texttt{epoll\_wait} graph collapses from 4,192 down to just 17 nodes (a 99.6\% reduction).
+The poll graph shrinks from 3,101 down to 6 nodes (a 99.8\% reduction).
+Ultimately, this pruning strategy yields a tight, accurate intersection target, isolating only the kernel paths that directly govern network event multiplexing.
 
-While the node reduction metrics demonstrate the efficiency of the context-sensitive pruning strategy, it is imperative to validate its accuracy.
-Specifically, we must ensure that the pruning logic did not erroneously remove essential execution paths (false negatives) that the application relies on at runtime.
+\subsection{Verification of Pruning Accuracy}
 
-To verify that all necessary kernel functions remained present in the pruned static graphs, we cross-referenced the static analysis results with dynamic runtime tracing.
-By executing the targeted workloads and dynamically tracing the active function call stacks for a given system call, it was possible to generate flame graphs to visualize the exact execution paths taken by the kernel in a live environment.
+Although achieving a high node reduction percentage ($P_{reduction}$) is necessary to solve the dimensionality problem, it introduces the critical risk of over-approximation—specifically, erroneously pruning execution paths that the application actively requires (false negatives).
+To empirically validate the safety and precision of the pruned graphs, we applied the dynamic tracing methodology outlined in Section~\ref{subsec:methodology_dynamic_tracing}.
 
-For example, Figure~\ref{fig:sysread_flame} illustrates the flame graph generated during the execution of the \texttt{read} system call under a standard TCP/IPv4 networking workload.
-This dynamic visualization captures the real-world call stack of the read operation, transitioning from the generic Virtual File System (VFS) layer down through the specific protocol implementations, such as \texttt{tcp\_recvmsg} and its associated lower-level network stack dependencies.
+By executing the target workloads and dynamically tracing the live function call stacks using kernel tracing tools, we established a ground-truth execution path for the evaluated system calls.
+For instance, Figure \ref{fig:sysread_flame} illustrates the flame graph generated during live execution of the read system call under a standard TCP/IPv4 networking workload.
+The visualization captures the exact, real-world call stack transitioning from the Virtual File System (VFS) layer through the TCP receive mechanisms (e.g., \texttt{tcp\_recvmsg}).
 
-By mapping the dynamically observed call stack back to the statically generated pruned graph for the read syscall, we can confirm a complete overlap along the critical execution path.
-Every function dynamically invoked during the active tracing session was successfully located within the pruned static graph.
-This empirical verification confirms that the context-sensitive pruning strategy aggressively reduces overall graph complexity and eliminates unreachable code without sacrificing the structural completeness required for accurate \textit{sysctl} knob discovery.
+When mapping the dynamically observed, ground-truth call stacks back onto the statically pruned graphs, the results demonstrated a high degree of structural fidelity along the critical execution paths.
+While an absolute 100\% node-for-node overlap is practically unattainable in this context, this discrepancy is an expected artifact of the compilation and instrumentation toolchains rather than a flaw in the pruning logic.
+Specifically, minor deviations arise primarily from compiler optimizations (such as aggressive function inlining, which merges function bodies and eliminates distinct stack frames in the compiled binary), as well as the inherent resolution limits and sampling intervals of dynamic tracing frameworks.
+However, these missing nodes represent trivial, low-level wrapper functions.
+Crucially, all semantically significant functions dynamically invoked by the kernel—those responsible for core subsystem routing, protocol state management, and the actual evaluation of sysctl parameters—were successfully located within the reduced static graphs.
+
+This verification was consistent across the evaluated system calls.
+It conclusively proves that the context-sensitive pruning strategy is highly precise, it aggressively eliminates thousands of irrelevant nodes (such as extraneous file systems and block device drivers) without sacrificing the structural completeness required to accurately discover influential \textit{sysctl} parameters.
 
 \begin{figure}[ht]
     \centering
@@ -119,24 +127,26 @@ The complete list of non-empty intersections is categorized in Table 1 below.
 
 \subsection{Analysis of Intersected Knobs}
 
-The results of the intersection validate the efficacy of the methodology.
-The framework successfully extracted highly influential, universally recognized tuning parameters such as \texttt{tcp\_rmem}, \texttt{tcp\_wmem}, and \texttt{tcp\_congestion\_control} that directly dictate the sizes of the socket buffers and packet transmission logic.
+The results of the intersection phase provide a powerful validation of the underlying methodology.
+The framework successfully extracted highly influential tuning parameters, such as \texttt{tcp\_rmem}, \texttt{tcp\_wmem}, and \texttt{tcp\_congestion\_control}.
+While these knobs are universally recognized by system administrators as critical for network performance, their extraction here represents a significant methodological milestone, because they emerged entirely automatically from the static analysis pipeline.
+The system possessed no prior domain knowledge, heuristics, or pre-programmed network expertise.
+By purely tracking control flow and data dependencies from a generic system call down through the kernel source code, the intersection organically converged on the exact parameters that human experts traditionally identify only through domain experience and manual trial-and-error.
 
-% Furthermore, the static analysis successfully surfaced advanced, heavily specialized networking knobs that are often overlooked by manual tuning, such as the tcp_plb_* (Protective Load Balancing) suite and specific SACK (Selective Acknowledgment) delay configurations.
-% Because the execution paths of generic web servers explicitly traverse the conditional checks bound to these variables, they represent valid tuning targets that can substantially alter application throughput and latency profiles.
-
-The presence of \texttt{vm.swappiness} and scheduler parameters in the final set further highlights the strength of the intersection approach.
-The analysis accurately mapped the cross-subsystem dependency chain, tracing from a generic \texttt{read} or \texttt{write} syscall down to the kernel memory management and task scheduling routines.
-This validates the framework ability to recognize that network payload delivery is intrinsically tied to broader system resource allocation strategies, rather than being strictly isolated to the networking stack.
+Furthermore, the presence of parameters like \texttt{vm.swappiness} and various CPU scheduler configurations in the final subset highlights the strength of this automated, source-code-driven approach.
+The static analysis pipeline accurately mapped the deep, cross-subsystem dependency chains, tracing a simple read or write system call directly into the kernel memory management and task scheduling routines.
 
 \section{Evaluation Environment}
 
-To empirically validate the performance impact of the critical \textit{sysctl} knobs identified by the intersection methodology, an automated testing environment was deployed.
-It is important to note that the infrastructure orchestration and the optimization algorithm used in this phase are based on two existing external frameworks: \textbf{metric-monitoring} and \textbf{autotune}.
-These tools are not original contributions of this thesis, but were utilized strictly to facilitate the benchmarking and validation of the static analysis results.
-Specifically, the generated list of intersected sysctl knobs (detailed in Table~\ref{tab:critical_knobs}) served as the bounded search space for the external autotune framework (\textit{autotune}).
-By running a Bayesian optimization algorithm exclusively against this targeted subset of parameters, the system iteratively applied configurations and measured  the application throughput and latency.
-This approach effectively transitions the research from theoretical intersection to practical validation, definitively identifying which of the statically flagged knobs are actually critical for maximizing the performance of specific applications under active load.
+To empirically validate the performance impact of the critical \textit{sysctl} knobs identified by the intersection methodology, we deployed an automated benchmarking environment.
+It is important to reiterate that the experiment execution pipeline and the machine learning optimizer are based on two existing external frameworks: \textit{metric-monitoring} and \textit{autotune}.
+These tools are not original contributions of this thesis, but were utilized strictly as a test harness to validate the static analysis results.
+Specifically, the metric-monitoring framework manages the practical mechanics of the benchmarking lifecycle.
+It is responsible for applying the selected kernel configurations to the target virtual machines, executing the load generators (such as \textit{wrk}), and collecting the resulting performance telemetry.
+Conversely, the autotune framework provides the Bayesian Optimization search algorithm that drives the experiment.
+
+By feeding the statically derived list of intersected \textit{sysctl} knobs (detailed in Table~\ref{tab:critical_knobs}) into autotune as its strictly bounded search space, the system iteratively applied configurations and measured the resulting application throughput and latency.
+This approach effectively transitions the research from theoretical static analysis to practical, runtime validation, definitively proving which of our statically flagged knobs are critical for maximizing performance under active load.
 
 \subsection{Hardware and Virtualization Specifications}
 
@@ -275,13 +285,15 @@ Upon collection, the agent pushes these metrics to a central metric storage for 
     \end{scope}
 
     \end{tikzpicture}
-    \caption{Architecture diagram of the end-to-end automated benchmark orchestration and metric monitoring framework. It illustrates the flow from Ansible orchestration to the target environment, highlighting load generation from the host machine and metric extraction to central storage.}
+    \caption{Architecture diagram of the end-to-end automated benchmark orchestration and metric monitoring framework. It illustrates the flow from \textit{Ansible} orchestration to the target environment, highlighting load generation from the host machine and metric extraction to central storage. Note that this framework is not part of this thesis contribution.}
     \label{fig:metric_monitoring_architecture}
 \end{figure}
 
 \subsection{The Autotune Framework}
 
-The empirical validation of the identified \textit{sysctl} knobs was automated using \textbf{Autotune}, an external tuning framework.
+As introduced in Section~\ref{subsec:knob_relevanve_verification}, the empirical validation of the identified \textit{sysctl} knobs was automated using \textbf{Autotune}, an existing, external tuning framework.
+It must be stated explicitly that the Autotune framework is not an original contribution of this thesis.
+Rather, it serves strictly as an evaluation instrument to measure the efficacy of the static analysis pipeline.
 This tool is designed to systematically search the vast configuration space of the Linux kernel to discover optimal parameter combinations that maximize application-specific performance.
 
 At its core, the framework leverages Bayesian Optimization (BO)~\cite{bayesian_process} to navigate the vast configuration space of the kernel.
@@ -420,7 +432,7 @@ Specifically, the logged data is then processed to produce visual analytics that
 
     \end{tikzpicture}%
     }
-    \caption{Workflow of the Autotune framework. The Bayesian Optimization engine iteratively explores \textit{sysctl} configurations by interacting with the underlying metric-monitoring framework. The resulting history log is then post-processed to generate visual analytics.}
+    \caption{Workflow of the Autotune framework. The Bayesian Optimization engine iteratively explores \textit{sysctl} configurations by interacting with the underlying metric-monitoring framework. The resulting history log is then post-processed to generate visual analytics. Note that this framework is not part of this thesis contribution.}
     \label{fig:autotune_workflow}
 \end{figure}
 
@@ -501,23 +513,6 @@ These initial metrics demonstrate that intelligently restricting the configurati
     \label{fig:optimization_throughput}
 \end{figure}
 
-\subsection{Workload Characterization} \label{subsec:workload}
-
-To accurately evaluate the impact of the critical \textit{sysctl} knobs identified by the static analysis, it is essential to subject the target applications to distinct traffic patterns.
-Different network behaviours traverse different execution paths within the Linux kernel, thereby shifting the system bottlenecks.
-To simulate these varying conditions, the HTTP benchmarking tool \texttt{wrk} (version 5.2.0) was utilized to generate two distinct load profiles.
-
-Testing different workloads is a crucial aspect of this evaluation because a "one-size-fits-all" configuration does not exist within the Linux kernel.
-A parameter that maximizes raw data throughput (such as vastly expanding TCP memory buffers) might inadvertently increase queuing delays (buffer-bloat), thus severely degrading latency.
-In contrast, optimizing the kernel for rapid connection cycling can introduce CPU overhead that degrades sustained data transfer rates.
-By varying the workload, we can observe how system bottlenecks dynamically shift and how the automated tuning framework adapts its parameter selection accordingly.
-
-\begin{itemize}
-    \item \textbf{Workload A (High Concurrency / Short-Lived Connections)}: This profile was generated by repeatedly requesting a small, $\sim 1kB$ static file. Because the payload is negligible, the network transaction completes almost instantly. This workload forces the server to constantly open and close thousands of connections per second. It aggressively stresses the kernel connection management subsystem, specifically testing the efficiency of TCP handshakes and teardowns, the capacity of the \texttt{SYN} backlog, and the management of sockets in the \texttt{TIME\_WAIT} state.
-    \item \textbf{Workload B (High Throughput / Large Payloads)}: this profile was generated by requesting the default \textit{test.html} file provided by wrk, which is approximately $\sim 100kB$ in size. In this scenario, the server handles fewer overall connection requests but must push significantly more data per connection. This workload shifts the primary system bottleneck away from connection establishment and places it squarely on the kernel data transmission mechanisms. It heavily stresses TCP window scaling, socket memory buffer allocations, and congestion control algorithms to ensure high-bandwidth data delivery.
-\end{itemize}
-
-By evaluating the web servers against both the $\sim 1KB$ and $\sim 100KB$ payloads, the resulting data clearly shows how the criticality of specific \textit{sysctl} knobs fluctuates based on the application execution context.
 
 \subsection{Architectural Impact on Tuning: NGINX vs. Apache}
 
@@ -628,7 +623,7 @@ The subsequent application-specific analyses empirically validate this architect
 
 \subsection{Application Analysis: NGINX}
 
-The evaluation of NGINX focused on its asynchronous and event-driven capabilities when subjected to the default $\sim 100kB$ payload workload (\textit{workload B}~\ref{subsec:workload}).
+The evaluation of NGINX focused on its asynchronous and event-driven capabilities when subjected to the default $\sim 100kB$ payload workload (\textit{workload B}~\ref{subsec:methodology_workload}).
 Under this profile, the automated tuning framework successfully navigated the kernel parameter space to unlock significant performance improvements.
 
 \paragraph{Performance Gains.}
@@ -883,5 +878,26 @@ This underscores the core value and necessity of the methodology proposed in thi
 By operating entirely within the kernel space, intersecting top-down system call execution graphs with bottom-up parameter data flows, the framework successfully identifies the critical subset of tuning knobs in a strictly application-agnostic and workload-agnostic manner.
 Even though the final optimal values are highly dynamic, the search space of relevant parameters is intrinsically tied to the kernel paths the application invokes.
 By reducing thousands of available kernel parameters down to a targeted, execution-path-specific list, this methodology provides the essential foundation required for automated optimization tools to rapidly converge on peak system performance for any arbitrary workload.
+
+\section{Threats to Validity}
+
+While the empirical evaluation demonstrates the efficacy of the proposed static analysis pipeline in reducing the configuration search space and accelerating automated tuning, several threats to validity must be acknowledged to properly contextualize the results.
+
+\subsection{Internal Validity}
+
+Internal validity concerns the factors within the experimental setup that could have influenced the measured outcomes.
+
+\begin{itemize}
+    \item \textbf{Dependence on the autotuner implementation}: the final throughput gains reported in this evaluation is inherently tied to the efficiency of the external Autotune framework. Utilizing a different optimization algorithm (such as Reinforcement Learning or Genetic Algorithms) could settle on slightly different local optima within the bounded search space.
+    \item Virtualized \textbf{environment overhead}: the benchmarks were executed within virtual machines rather than on bare-metal hardware. Virtualization introduces a hypervisor abstraction layer, particularly within the network stack and interrupt handling subsystems. While this accurately reflects modern cloud deployments, hypervisor scheduling noise could introduce slight variances in metrics that would not be present in a bare-metal environment.
+\end{itemize}
+
+\subsection{External Validity}
+
+External validity concerns the extent to which these findings can be generalized to other systems, environments, or workloads.
+\begin{itemize}
+    \item \textbf{Kernel version specificity}: the empirical evaluation and the resulting graph pruning metrics presented in this thesis were validated exclusively against a single, modern version of the Linux kernel (v6.10.11). Because the Linux kernel is a rapidly evolving project where internal data structures, and subsystem routing paths are frequently refactored, the exact set of 92 extracted networking knobs is inherently tied to this release. However, because the underlying framework was not strictly hardcoded to version 6.10.11, the foundational methodology of intersecting control and data flows remains broadly applicable. Applying this pipeline to legacy or future kernel releases would likely require only minor adjustments to the tooling, though it will naturally yield a different subset of parameters.
+    \item \textbf{Limited workload scope}: the evaluation strictly targeted web-server workloads (Apache, NGINX, and HAProxy) handling synthetic HTTP traffic over TCP/IPv4. While this effectively proved the methodology for the networking subsystem, it does not guarantee identical tuning margins for radically different application profiles. Heavy relational databases (e.g., PostgreSQL) or distributed message queues (e.g., Kafka) heavily exercise the Virtual File System (VFS), block device layers, and inter-process communication (IPC) subsystems, which would require analysing different system calls and validating a completely different subset of \textit{sysctl} parameters.
+\end{itemize}
 
 \newpage

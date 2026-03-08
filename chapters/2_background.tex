@@ -129,15 +129,13 @@ Although different works target different systems (databases, stream processors,
     \item Update a search policy/model based on measurements.
     \item Repeat until a sample budget or convergence is reached.
 \end{enumerate}
-However, the efficiency of this loop is highly dependent on the quality of the initial knob selection.
-An example of autotuning architecture can be found in Figure \ref{fig:autotuning_loop}.
 
-% \begin{figure}
-%     \centering
-%     \includesvg[width=1\linewidth]{images/2_background/knob_autotuining_loop}
-%     \caption{High-level architecture of a typical autotuning framework. The system is divided into a knob identification phase, which filters the search space to find critical parameters, and an online autotuning loop, which iteratively optimizes these parameters using feedback from the target system.}
-%     \label{fig:autotuning_loop}
-% \end{figure}
+However, the efficiency of this iterative loop is highly dependent on the quality of the initial parameter selection.
+Figure~\ref{fig:autotuning_loop} illustrates the end-to-end architecture of a modern automated tuning system, explicitly dividing the workflow into two distinct phases:
+\begin{enumerate}
+    \item \textbf{Knob identification}: the process begins by passing all \textit{sysctl} knobs through a knob selector to discard irrelevant parameters. This generates a filtered knob subset, which drastically reduces the dimensionality of the search space before any tuning begins.
+    \item \textbf{The autotuning loop}: this phase iteratively tests configurations from the filtered subset. The tuning controller orchestrates the cycle, directing the experiment executor to apply a configuration vector to the target system. The metrics collector captures the resulting performance and stores it in the knowledge base. Finally, the configuration optimizer (leveraging models like Bayesian Optimization or RL) analyses the historical data to intelligently select the next most promising configuration to test, repeating the loop until convergence.
+\end{enumerate}
 
 \begin{figure}[htbp]
     \centering
@@ -156,7 +154,6 @@ An example of autotuning architecture can be found in Figure \ref{fig:autotuning
             bluenode/.style={draw, fill=boxblue, minimum width=3.2cm, minimum height=1.4cm, align=center},
             innergray/.style={draw, fill=nodegray, minimum width=2.8cm, minimum height=1cm, align=center}
         ]
-
             % ==========================================
             % 1. BACKGROUND BOUNDING BOXES
             % ==========================================
@@ -169,7 +166,6 @@ An example of autotuning architecture can be found in Figure \ref{fig:autotuning
             \draw[fill=bglightgray, draw=black!70] (12.8, -5.5) rectangle (22.4, 6.8);
             \node[anchor=north, font=\bfseries, text=black!80] at (17.6, 6.6) {Autotuning Loop};
 
-
             % ==========================================
             % 2. LEFT PHASE: KNOB IDENTIFICATION
             % ==========================================
@@ -181,7 +177,6 @@ An example of autotuning architecture can be found in Figure \ref{fig:autotuning
             \draw[->, thick] (all_knobs) -- (selector);
             \draw[->, thick] (selector) -- (filtered);
 
-
             % ==========================================
             % 3. BIG CONNECTING ARROW
             % ==========================================
@@ -189,7 +184,6 @@ An example of autotuning architecture can be found in Figure \ref{fig:autotuning
             % Adjusted to sit perfectly between the two newly sized boxes
             \filldraw[fill=boxblue, draw=black!80, thick]
                 (11.4, 1.7) -- (12.1, 1.7) -- (12.1, 1.4) -- (12.6, 2.0) -- (12.1, 2.6) -- (12.1, 2.3) -- (11.4, 2.3) -- cycle;
-
 
             % ==========================================
             % 4. RIGHT PHASE: AUTOTUNING LOOP
@@ -217,7 +211,6 @@ An example of autotuning architecture can be found in Figure \ref{fig:autotuning
             % Configuration Optimizer (Moved up to y=4.8 to avoid overlap)
             \node[bluenode, minimum height=1.8cm] (optimizer) at (20, 4.8) {Configuration\\Optimizer (e.g.,\\Bayesian\\Optimization, RL)};
 
-
             % ==========================================
             % 5. RIGHT PHASE CONNECTIONS (ARROWS)
             % ==========================================
@@ -236,7 +229,7 @@ An example of autotuning architecture can be found in Figure \ref{fig:autotuning
 
         \end{tikzpicture}%
     }
-    \caption{System Architecture: Knob Identification Phase and Autotuning Loop}
+    \caption{System Architecture: knob identification phase and autotuning loop}
     \label{fig:autotuning_loop}
 \end{figure}
 

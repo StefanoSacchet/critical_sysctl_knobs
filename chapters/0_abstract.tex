@@ -3,17 +3,22 @@
 \addcontentsline{toc}{chapter}{Abstract} % add to index
 
 Modern cloud infrastructures increasingly host specialized, single-application workloads, but these systems still run on a general-purpose Linux kernel configured through broad default \textit{sysctl} settings.
-While safe and portable, default configurations are often suboptimal for high-performance services, and manual tuning is impractical due to the large configuration space and the complex interactions among kernel parameters.
-This thesis addresses that gap by proposing an application-agnostic methodology to identify, before optimization, only the kernel knobs that can materially affect a target workload.
+While these default configurations ensure stability and portability, they are frequently suboptimal for high-performance services.
+Because the kernel configuration space is massive and complex, manual tuning is largely impractical.
+This thesis addresses that gap by proposing an application-agnostic methodology to automatically identify which kernel knobs will actually affect a target workload before the optimization process begins.
 
-The core contribution is a static analysis pipeline that combines two complementary views of kernel behaviour: a top-down reconstruction of execution paths activated by application system calls, and a bottom-up analysis of where and how \textit{sysctl} knobs are evaluated along those paths.
-Their intersection produces a reduced, execution-relevant subset of tunables, transforming a high-dimensional search space into a reduced set suitable for automated optimization.
+To achieve this, the core contribution is a static analysis pipeline that combines two complementary views of kernel behaviour.
+First, it performs a top-down reconstruction of the execution paths triggered by a system call.
+Second, it uses a bottom-up analysis to map where specific \textit{sysctl} knobs are evaluated within the kernel code.
+Intersecting these two views filters out irrelevant parameters, transforming a highly complex, high-dimensional search space into a drastically reduced subset of knobs suitable for automated optimization.
 
-The methodology is implemented and evaluated on real web-server workloads, then coupled with Bayesian Optimization for parameter search.
-Experimental results show substantial throughput gains across different architectures, with improvements up to 23\% for Apache HTTP Server and around 15\% for NGINX and HAProxy.
-Beyond aggregate gains, the study confirms that the central thesis idea works in practice: static kernel-path analysis can effectively guide autotuning toward meaningful performance improvements.
-The results also show that optimal kernel configurations are workload- and architecture-dependent, as thread-oriented and event-driven servers expose different bottlenecks and therefore require different tuning strategies.
+The methodology is implemented and evaluated on web-server workloads (Apache HTTP Server, NGINX, and HAProxy).
+To quantify performance, we measured application throughput (Requests Per Second) under heavy concurrency, comparing the optimized configurations against the default, un-tuned Linux kernel baseline.
+Throughput was selected as the primary metric because it aggressively stresses the kernel network stack and connection management subsystems.
+By coupling the targeted, reduced search space with an existing autotuner, we significantly decreased the overall tuning time required for the algorithm to reach convergence.
+Furthermore, the system successfully discovered configurations that yielded substantial throughput gains: up to 23\% for Apache and approximately 15\% for NGINX and HAProxy.
 
-Overall, this work bridges static operating system analysis and autotuning by demonstrating that relevant kernel search spaces can be derived systematically from kernel execution semantics. The proposed approach provides a practical foundation for scalable, autonomous kernel tuning in modern virtualized environments.
+Overall, the experimental results confirm that static analysis of kernel paths can effectively and efficiently guide automated tuning toward meaningful performance improvements.
+Ultimately, this work bridges the gap between static operating system analysis and automated tuning, providing a practical foundation for scalable, autonomous kernel optimization in modern virtualized environments.
 
 \newpage
